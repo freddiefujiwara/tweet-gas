@@ -1,48 +1,58 @@
 # tweet-gas
 
-X（@freddiefujiwara）へ投稿するための Google Apps Script バックエンド。
+A Google Apps Script (GAS) project that posts tweets to X (@freddiefujiwara).
 
-- 投稿：`POST https://api.twitter.com/2/tweets`（OAuth 1.0a ユーザーコンテキスト、HMAC-SHA1 署名を自前実装）
-- 認証：Web アプリ（doPost）は Google ID トークンを検証し、メールアドレスが
-  `zegenvs@gmail.com` の場合だけ投稿を受け付ける
-- 確認：投稿後にツイートIDで再取得し、本文を照合して返す
-- ログ：API から返ってきた情報はすべて、紐付けスプレッドシートの `log` シートに記録する
-  （時刻・action・detail の3列。detail は JSON 文字列で、HTTP メソッド、URL、ステータス、
-  レスポンス全文を含む。URL のクエリ文字列は ID トークンを含むため記録しない。
-  doPost の成否も記録する。ログ書き込みの失敗で本処理は止めない）
-- フロントエンドは別リポジトリ `tweet`
+## What it does
 
-## Script Properties（キーはコードに書かない）
+- Posts a tweet with the X API (`POST /2/tweets`).
+- Signs each request with OAuth 1.0a (HMAC-SHA1). The code makes the signature by itself.
+- Only one person can use the web app. The request must have a Google ID token, and the email in the token must be `zegenvs@gmail.com`.
+- After posting, it gets the tweet one more time by ID and checks the text.
+- It writes all API responses to the `log` sheet of the spreadsheet.
 
-Apps Script エディタの「プロジェクトの設定」で以下を設定する。
+## Logs
 
-| キー | 値 |
-|---|---|
-| `X_CONSUMER_KEY` | X デベロッパーコンソールの Consumer Key |
-| `X_CONSUMER_SECRET` | 同 Consumer Secret |
-| `X_ACCESS_TOKEN` | 同 Access Token（Read and write） |
-| `X_ACCESS_TOKEN_SECRET` | 同 Access Token Secret |
-| `GOOGLE_CLIENT_ID` | （任意）IDトークンの aud を固定する場合に設定 |
+Each API call adds one row to the `log` sheet:
 
-## 初回セットアップ
+- `time`: when the call happened
+- `action`: what happened (`fetch` or `doPost`)
+- `detail`: a JSON string with the HTTP method, the URL, the status code, and the full response text
 
-1. https://script.google.com で新規プロジェクトを作成し、その Script ID を `.clasp.json` の `scriptId` に設定する
-2. 上記の Script Properties を設定する
-3. GitHub リポジトリの Secrets に `CLASPRC_JSON`（clasp の認証情報）を設定する
-4. `.github/workflows/node.yaml` を追加する（このファイルは GitHub App の権限外のため、Web UI から手動で追加する。内容は time-table-gas と同一）
-5. main へ push すると CI がテスト→ビルド→ `clasp push` →バージョン作成→デプロイまで行う
-   - 既存デプロイを更新する場合は Secret `DEPLOYMENT_ID` も設定する
-6. デプロイされた Web アプリの `/exec` URL を、フロントエンド `tweet` の `config.js` に設定する
+The URL query string is not saved, because the token check URL has the ID token in it. If writing a log fails, posting still works.
 
-## 動作確認
+## Script Properties
 
-- エディタで `postTestTweet()` を実行すると、時刻入りのテスト投稿が行われ、ログにツイートURLが出る
-- Web アプリの `/exec` へ GET すると `{"ok":true,"service":"tweet-gas",...}` が返る
+The API keys are not in the code. Set them in the Apps Script project settings.
 
-## 開発
+| Key | Value |
+| --- | --- |
+| `X_CONSUMER_KEY` | Consumer Key from the X developer console |
+| `X_CONSUMER_SECRET` | Consumer Secret from the X developer console |
+| `X_ACCESS_TOKEN` | Access Token (Read and write) |
+| `X_ACCESS_TOKEN_SECRET` | Access Token Secret |
+| `GOOGLE_CLIENT_ID` | (optional) If set, the ID token must be for this client |
+
+## Setup
+
+1. Make a GAS project bound to a spreadsheet, and set its Script ID in `.clasp.json`.
+2. Set the Script Properties above.
+3. Add the `CLASPRC_JSON` secret to this GitHub repository.
+4. Add `.github/workflows/node.yaml` by hand in the GitHub web UI. It is the same file as in time-table-gas. A copy is in `ci/node.yaml.txt`.
+5. Push to main. CI runs the tests, builds the code, pushes it to Apps Script, and makes a new deployment.
+6. Copy the web app `/exec` URL to `config.js` in the `tweet` frontend repository.
+
+## Test it
+
+- Run `postTestTweet()` in the Apps Script editor. It posts a test tweet with the current time, and writes the tweet URL to the log.
+- Open the `/exec` URL with GET. It returns `{"ok":true,"service":"tweet-gas",...}`.
+
+## Development
 
 ```bash
 npm install
-npm test        # vitest（署名は RFC 5849 の公式テストベクタで検証）
-npm run build   # src/Code.js -> dist/Code.gs
+npm test
+npm run build
 ```
+
+- `npm test` runs the tests. The signature code is tested with the official RFC 5849 test vector.
+- `npm run build` makes `dist/Code.gs` from `src/Code.js`.
