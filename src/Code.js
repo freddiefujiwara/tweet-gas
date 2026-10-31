@@ -13,6 +13,27 @@ export const API_BASE = 'https://api.twitter.com/2';
 export const ALLOWED_EMAIL = 'zegenvs@gmail.com';
 export const SCREEN_NAME = 'freddiefujiwara';
 export const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
+export const LOG_SHEET_NAME = 'log';
+export const LOG_DETAIL_MAX = 40000;
+
+/**
+ * Appends one row to the "log" sheet of the bound spreadsheet.
+ * Logging must never break the main flow, so errors are swallowed.
+ * detail is stored as a JSON string in a single cell.
+ */
+export function logToSheet(action, detail) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(LOG_SHEET_NAME);
+    if (!sheet) {
+      sheet = ss.insertSheet(LOG_SHEET_NAME);
+      sheet.appendRow(['time', 'action', 'detail']);
+    }
+    sheet.appendRow([new Date().toISOString(), action, JSON.stringify(detail)]);
+  } catch (e) {
+    // ignore logging failures
+  }
+}
 
 /**
  * RFC 3986 percent-encoding as required by OAuth 1.0a.
@@ -120,6 +141,15 @@ function fetchJson(url, options) {
   } catch (e) {
     // keep json as null; handled by caller via status code
   }
+  // Log everything the API returned. The query string is stripped because
+  // the tokeninfo URL carries the ID token itself (claims in the response
+  // body are fine to log; the credential is not).
+  logToSheet('fetch', {
+    method: (options.method || 'get').toUpperCase(),
+    url: url.split('?')[0],
+    status: code,
+    response: text.length > LOG_DETAIL_MAX ? text.slice(0, LOG_DETAIL_MAX) + '…(truncated)' : text,
+  });
   return { code, json, text };
 }
 
@@ -213,19 +243,24 @@ export function doPost(e) {
     const body = JSON.parse(e.postData.contents);
     const identity = verifyIdToken(body.idToken);
     if (!identity) {
+      logToSheet('doPost', { ok: false, error: 'unauthorized' });
       return jsonOutput({ ok: false, error: 'unauthorized' });
     }
     const posted = postTweet(body.text);
     const verified = getTweet(posted.id);
-    return jsonOutput({
+    const result = {
       ok: true,
       id: posted.id,
       url: posted.url,
       postedText: posted.text,
       verifiedText: verified ? verified.text : null,
-    });
+    };
+    logToSheet('doPost', { email: identity.email, ...result });
+    return jsonOutput(result);
   } catch (err) {
-    return jsonOutput({ ok: false, error: String(err && err.message ? err.message : err) });
+    const message = String(err && err.message ? err.message : err);
+    logToSheet('doPost', { ok: false, error: message });
+    return jsonOutput({ ok: false, error: message });
   }
 }
 

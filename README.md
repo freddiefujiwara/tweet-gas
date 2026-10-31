@@ -6,6 +6,10 @@ X（@freddiefujiwara）へ投稿するための Google Apps Script バックエ�
 - 認証：Web アプリ（doPost）は Google ID トークンを検証し、メールアドレスが
   `zegenvs@gmail.com` の場合だけ投稿を受け付ける
 - 確認：投稿後にツイートIDで再取得し、本文を照合して返す
+- ログ：API から返ってきた情報はすべて、紐付けスプレッドシートの `log` シートに記録する
+  （時刻・action・detail の3列。detail は JSON 文字列で、HTTP メソッド、URL、ステータス、
+  レスポンス全文を含む。URL のクエリ文字列は ID トークンを含むため記録しない。
+  doPost の成否も記録する。ログ書き込みの失敗で本処理は止めない）
 - フロントエンドは別リポジトリ `tweet`
 
 ## Script Properties（キーはコードに書かない）

@@ -18,6 +18,19 @@ global.PropertiesService = {
   getScriptProperties: () => ({ getProperty: mockGetProperty }),
 };
 global.UrlFetchApp = { fetch: mockFetch };
+
+const appendedRows = [];
+let sheetExists = true;
+const mockSheet = { appendRow: (row) => appendedRows.push(row) };
+global.SpreadsheetApp = {
+  getActiveSpreadsheet: () => ({
+    getSheetByName: () => (sheetExists ? mockSheet : null),
+    insertSheet: () => {
+      sheetExists = true;
+      return mockSheet;
+    },
+  }),
+};
 global.ContentService = {
   MimeType: { JSON: 'JSON' },
   createTextOutput: (text) => ({
@@ -45,6 +58,8 @@ function fetchResponse(code, obj) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  appendedRows.length = 0;
+  sheetExists = true;
   mockGetProperty.mockImplementation((name) => KEYS[name] ?? null);
 });
 
@@ -178,6 +193,50 @@ describe('doPost', () => {
     expect(body.id).toBe('555');
     expect(body.url).toBe('https://x.com/freddiefujiwara/status/555');
     expect(body.verifiedText).toBe('hi');
+  });
+});
+
+describe('spreadsheet logging', () => {
+  it('logs the full API response of a post to the log sheet', () => {
+    mockFetch.mockReturnValue(fetchResponse(201, { data: { id: '123', text: 'hello' } }));
+    Code.postTweet('hello');
+    expect(appendedRows).toHaveLength(1);
+    const [time, action, detail] = appendedRows[0];
+    expect(action).toBe('fetch');
+    const parsed = JSON.parse(detail);
+    expect(parsed.method).toBe('POST');
+    expect(parsed.url).toBe('https://api.twitter.com/2/tweets');
+    expect(parsed.status).toBe(201);
+    expect(parsed.response).toContain('"id":"123"');
+    expect(typeof time).toBe('string');
+  });
+
+  it('strips the query string (ID token) from logged URLs', () => {
+    mockFetch.mockReturnValue(
+      fetchResponse(200, { email: 'zegenvs@gmail.com', email_verified: 'true' })
+    );
+    Code.verifyIdToken('SECRET_TOKEN_VALUE');
+    const detail = JSON.parse(appendedRows[0][2]);
+    expect(detail.url).toBe('https://oauth2.googleapis.com/tokeninfo');
+    expect(detail.response).not.toContain('SECRET_TOKEN_VALUE');
+  });
+
+  it('creates the log sheet with a header when missing', () => {
+    sheetExists = false;
+    mockFetch.mockReturnValue(fetchResponse(201, { data: { id: '1', text: 'x' } }));
+    Code.postTweet('x');
+    expect(appendedRows[0]).toEqual(['time', 'action', 'detail']);
+    expect(appendedRows).toHaveLength(2);
+  });
+
+  it('never breaks posting when logging fails', () => {
+    global.SpreadsheetApp = {
+      getActiveSpreadsheet: () => {
+        throw new Error('no spreadsheet');
+      },
+    };
+    mockFetch.mockReturnValue(fetchResponse(201, { data: { id: '7', text: 'ok' } }));
+    expect(Code.postTweet('ok').id).toBe('7');
   });
 });
 

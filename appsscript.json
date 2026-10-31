@@ -1,1 +1,1 @@
-{"exceptionLogging":"STACKDRIVER","oauthScopes":["https://www.googleapis.com/auth/script.external_request"],"runtimeVersion":"V8","timeZone":"Asia/Tokyo","webapp":{"access":"ANYONE","executeAs":"USER_DEPLOYING"}}
+{"exceptionLogging":"STACKDRIVER","oauthScopes":["https://www.googleapis.com/auth/script.external_request","https://www.googleapis.com/auth/spreadsheets"],"runtimeVersion":"V8","timeZone":"Asia/Tokyo","webapp":{"access":"ANYONE","executeAs":"USER_DEPLOYING"}}
