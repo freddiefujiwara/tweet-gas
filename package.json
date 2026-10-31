@@ -1,0 +1,1 @@
+{"devDependencies":{"@vitest/coverage-v8":"^1.6.0","vitest":"^1.6.0"},"name":"tweet-gas","scripts":{"build":"node build.js","deploy":"npm run build && clasp push --force","test":"vitest run --coverage"}}
