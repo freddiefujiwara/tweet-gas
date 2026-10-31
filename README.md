@@ -37,7 +37,7 @@ The API keys are not in the code. Set them in the Apps Script project settings.
 1. Make a GAS project bound to a spreadsheet, and set its Script ID in `.clasp.json`.
 2. Set the Script Properties above.
 3. Add the `CLASPRC_JSON` secret to this GitHub repository.
-4. Add `.github/workflows/node.yaml` by hand in the GitHub web UI. It is the same file as in time-table-gas. A copy is in `ci/node.yaml.txt`.
+4. Add `.github/workflows/node.js.yml` by hand in the GitHub web UI. It is the same workflow as in time-table-gas.
 5. Push to main. CI runs the tests, builds the code, pushes it to Apps Script, and makes a new deployment.
 6. Copy the web app `/exec` URL to `config.js` in the `tweet` frontend repository.
 
