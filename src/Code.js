@@ -66,7 +66,12 @@ export function signatureBaseString(method, baseUrl, params) {
  */
 export function hmacSha1Base64(baseString, consumerSecret, tokenSecret) {
   const key = `${percentEncode(consumerSecret)}&${percentEncode(tokenSecret || '')}`;
-  const bytes = Utilities.computeHmacSha1Signature(baseString, key);
+  // There is no computeHmacSha1Signature in Apps Script; use the generic API.
+  const bytes = Utilities.computeHmacSignature(
+    Utilities.MacAlgorithm.HMAC_SHA_1,
+    baseString,
+    key
+  );
   return Utilities.base64Encode(bytes);
 }
 

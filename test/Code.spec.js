@@ -8,8 +8,11 @@ const mockGetProperty = vi.fn();
 const mockFetch = vi.fn();
 
 global.Utilities = {
-  computeHmacSha1Signature: (value, key) =>
-    crypto.createHmac('sha1', key).update(value, 'utf8').digest(),
+  MacAlgorithm: { HMAC_SHA_1: 'HMAC_SHA_1' },
+  computeHmacSignature: (algorithm, value, key) => {
+    if (algorithm !== 'HMAC_SHA_1') throw new Error('unexpected algorithm: ' + algorithm);
+    return crypto.createHmac('sha1', key).update(value, 'utf8').digest();
+  },
   base64Encode: (bytes) => Buffer.from(bytes).toString('base64'),
   getUuid: () => '12345678-1234-4234-8234-123456789012',
   formatDate: () => '2026-11-01 05:00:00',
