@@ -16,6 +16,118 @@ export const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
 export const LOG_SHEET_NAME = 'log';
 export const LOG_DETAIL_MAX = 40000;
 
+// --- Temporary share sessions (temporary access links) ---
+// A logged-in owner can issue a URL token that grants the same access
+// as the owner for SHARE_TTL_SECONDS without a Google account (for
+// tweet, that means posting). Sessions are stored in a dedicated
+// sheet (token hashes only, never raw tokens), which doubles as an
+// audit log. The sheet is never exposed through the API.
+
+export const SHARE_SHEET_NAME = 'share_sessions';
+// One month, so the owner can hand the link over well in advance.
+export const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
+export const SHARE_HEADERS = [
+  'token_hash',
+  'issued_at',
+  'expires_at',
+  'revoked_at',
+  'access_count',
+  'last_accessed_at',
+];
+
+function getShareSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SHARE_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHARE_SHEET_NAME);
+    sheet.appendRow(SHARE_HEADERS);
+  }
+  return sheet;
+}
+
+function hashShareToken(token) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(token))
+    .map((byte) => ((byte % 256) + 256) % 256)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function readShareRows() {
+  const sheet = getShareSheet();
+  const values = sheet.getDataRange().getValues();
+  return { sheet, values };
+}
+
+function shareCellIso(value) {
+  if (!value) {
+    return '';
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  return String(value);
+}
+
+function revokeActiveShareSessions(nowIso) {
+  const { sheet, values } = readShareRows();
+  values.forEach((row, index) => {
+    if (index === 0) {
+      return;
+    }
+    const revokedAt = shareCellIso(row[3]);
+    const expiresAt = shareCellIso(row[2]);
+    if (!revokedAt && expiresAt && expiresAt > nowIso) {
+      sheet.getRange(index + 1, 4).setValue(nowIso);
+    }
+  });
+}
+
+function issueShareSession() {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresIso = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000).toISOString();
+  revokeActiveShareSessions(nowIso);
+  const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  getShareSheet().appendRow([hashShareToken(token), nowIso, expiresIso, '', 0, '']);
+  return {
+    share_token: token,
+    issued_at: nowIso,
+    expires_at: expiresIso,
+    ttl_seconds: SHARE_TTL_SECONDS,
+  };
+}
+
+function revokeShareSession() {
+  revokeActiveShareSessions(new Date().toISOString());
+  return { revoked: true };
+}
+
+function validateShareToken(token) {
+  if (!token) {
+    return null;
+  }
+  const hash = hashShareToken(token);
+  const { sheet, values } = readShareRows();
+  const nowIso = new Date().toISOString();
+  for (let index = 1; index < values.length; index += 1) {
+    const row = values[index];
+    if (row[0] !== hash) {
+      continue;
+    }
+    if (shareCellIso(row[3])) {
+      return null;
+    }
+    const expiresAt = shareCellIso(row[2]);
+    if (!expiresAt || expiresAt <= nowIso) {
+      return null;
+    }
+    sheet.getRange(index + 1, 5).setValue(Number(row[4] || 0) + 1);
+    sheet.getRange(index + 1, 6).setValue(nowIso);
+    return { expires_at: expiresAt };
+  }
+  return null;
+}
+
 /**
  * Appends one row to the "log" sheet of the bound spreadsheet.
  * Logging must never break the main flow, so errors are swallowed.
@@ -240,16 +352,56 @@ export function doGet() {
 }
 
 /**
- * POST { idToken, text } -> posts and verifies.
- * Returns { ok, id, url, postedText, verifiedText } or { ok: false, error }.
+ * POST JSON API. Bodies:
+ * - { idToken, text }                       -> posts and verifies.
+ * - { share_token, text }                   -> same, via a share link.
+ * - { idToken, action: "issue_share" }      -> issues a share link.
+ * - { idToken, action: "revoke_share" }     -> revokes active links.
+ * - { share_token, action: "validate_share" } -> checks a link and
+ *   returns its expiry as { ok, _share: { expires_at } }.
+ * Returns { ok, id, url, postedText, verifiedText } (post) or
+ * { ok: false, error }.
  */
 export function doPost(e) {
   try {
     const body = JSON.parse(e.postData.contents);
-    const identity = verifyIdToken(body.idToken);
-    if (!identity) {
-      logToSheet('doPost', { ok: false, error: 'unauthorized' });
-      return jsonOutput({ ok: false, error: 'unauthorized' });
+    if (body.action === 'issue_share' || body.action === 'revoke_share') {
+      const identity = verifyIdToken(body.idToken);
+      if (!identity) {
+        logToSheet('doPost', { ok: false, error: 'unauthorized' });
+        return jsonOutput({ ok: false, error: 'unauthorized' });
+      }
+      const result =
+        body.action === 'issue_share' ? issueShareSession() : revokeShareSession();
+      logToSheet(body.action, { ok: true, email: identity.email });
+      return jsonOutput({ ok: true, ...result });
+    }
+    let identity = null;
+    let shareSession = null;
+    if (body.share_token) {
+      shareSession = validateShareToken(body.share_token);
+      if (!shareSession) {
+        logToSheet('doPost', { ok: false, error: 'unauthorized' });
+        return jsonOutput({ ok: false, error: 'unauthorized' });
+      }
+    } else {
+      identity = verifyIdToken(body.idToken);
+      if (!identity) {
+        logToSheet('doPost', { ok: false, error: 'unauthorized' });
+        return jsonOutput({ ok: false, error: 'unauthorized' });
+      }
+    }
+    if (body.action === 'validate_share') {
+      // Reached only with a valid share session (see above); an ID
+      // token alone cannot validate a share link.
+      if (!shareSession) {
+        logToSheet('doPost', { ok: false, error: 'unauthorized' });
+        return jsonOutput({ ok: false, error: 'unauthorized' });
+      }
+      return jsonOutput({
+        ok: true,
+        _share: { expires_at: shareSession.expires_at },
+      });
     }
     const posted = postTweet(body.text);
     const verified = getTweet(posted.id);
@@ -260,7 +412,13 @@ export function doPost(e) {
       postedText: posted.text,
       verifiedText: verified ? verified.text : null,
     };
-    logToSheet('doPost', { email: identity.email, ...result });
+    if (shareSession) {
+      result._share = { expires_at: shareSession.expires_at };
+    }
+    logToSheet('doPost', {
+      email: identity ? identity.email : '(share link)',
+      ...result,
+    });
     return jsonOutput(result);
   } catch (err) {
     const message = String(err && err.message ? err.message : err);
