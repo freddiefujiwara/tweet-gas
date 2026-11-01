@@ -7,14 +7,21 @@ import * as Code from '../src/Code.js';
 const mockGetProperty = vi.fn();
 const mockFetch = vi.fn();
 
+let uuidCounter = 0;
 global.Utilities = {
   MacAlgorithm: { HMAC_SHA_1: 'HMAC_SHA_1' },
+  DigestAlgorithm: { SHA_256: 'SHA_256' },
   computeHmacSignature: (algorithm, value, key) => {
     if (algorithm !== 'HMAC_SHA_1') throw new Error('unexpected algorithm: ' + algorithm);
     return crypto.createHmac('sha1', key).update(value, 'utf8').digest();
   },
+  computeDigest: (algorithm, value) => {
+    if (algorithm !== 'SHA_256') throw new Error('unexpected algorithm: ' + algorithm);
+    return [...crypto.createHash('sha256').update(String(value), 'utf8').digest()];
+  },
   base64Encode: (bytes) => Buffer.from(bytes).toString('base64'),
-  getUuid: () => '12345678-1234-4234-8234-123456789012',
+  getUuid: () =>
+    `00000000-0000-4000-8000-${String(uuidCounter++).padStart(12, '0')}`,
   formatDate: () => '2026-11-01 05:00:00',
 };
 global.PropertiesService = {
@@ -25,15 +32,50 @@ global.UrlFetchApp = { fetch: mockFetch };
 const appendedRows = [];
 let sheetExists = true;
 const mockSheet = { appendRow: (row) => appendedRows.push(row) };
-global.SpreadsheetApp = {
-  getActiveSpreadsheet: () => ({
-    getSheetByName: () => (sheetExists ? mockSheet : null),
-    insertSheet: () => {
-      sheetExists = true;
-      return mockSheet;
+
+const SHARE_HEADERS = [
+  'token_hash',
+  'issued_at',
+  'expires_at',
+  'revoked_at',
+  'access_count',
+  'last_accessed_at',
+];
+let shareValues = [];
+let shareSheetExists = true;
+const mockShareSheet = {
+  appendRow: (row) => shareValues.push([...row]),
+  getDataRange: () => ({ getValues: () => shareValues }),
+  getRange: (row, col) => ({
+    setValue: (value) => {
+      shareValues[row - 1][col - 1] = value;
     },
   }),
 };
+
+function installSpreadsheetApp() {
+  global.SpreadsheetApp = {
+    getActiveSpreadsheet: () => ({
+      getSheetByName: (name) =>
+        name === 'share_sessions'
+          ? shareSheetExists
+            ? mockShareSheet
+            : null
+          : sheetExists
+            ? mockSheet
+            : null,
+      insertSheet: (name) => {
+        if (name === 'share_sessions') {
+          shareSheetExists = true;
+          return mockShareSheet;
+        }
+        sheetExists = true;
+        return mockSheet;
+      },
+    }),
+  };
+}
+installSpreadsheetApp();
 global.ContentService = {
   MimeType: { JSON: 'JSON' },
   createTextOutput: (text) => ({
@@ -63,6 +105,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   appendedRows.length = 0;
   sheetExists = true;
+  shareValues = [[...SHARE_HEADERS]];
+  shareSheetExists = true;
+  uuidCounter = 0;
+  installSpreadsheetApp();
   mockGetProperty.mockImplementation((name) => KEYS[name] ?? null);
 });
 
@@ -249,5 +295,166 @@ describe('doGet', () => {
     const body = JSON.parse(out.text);
     expect(body.ok).toBe(true);
     expect(body.service).toBe('tweet-gas');
+  });
+});
+
+describe('doPost share sessions', () => {
+  const event = (obj) => ({ postData: { contents: JSON.stringify(obj) } });
+  const post = (obj) => JSON.parse(Code.doPost(event(obj)).text);
+  const shareHashOf = (token) =>
+    crypto.createHash('sha256').update(String(token), 'utf8').digest('hex');
+
+  // Routes fetches by URL: tokeninfo for auth, X API for posting.
+  function mockAllFetches() {
+    mockFetch.mockImplementation((url, options) => {
+      if (String(url).includes('tokeninfo')) {
+        return fetchResponse(200, { email: 'zegenvs@gmail.com', email_verified: 'true' });
+      }
+      if (options && options.method === 'post') {
+        return fetchResponse(201, { data: { id: '555', text: 'hi' } });
+      }
+      return fetchResponse(200, { data: { id: '555', text: 'hi' } });
+    });
+  }
+
+  const issueToken = () => {
+    mockAllFetches();
+    const result = post({ idToken: 'good', action: 'issue_share' });
+    expect(result.ok).toBe(true);
+    return result.share_token;
+  };
+
+  it('requires an ID token to issue a share session', () => {
+    mockFetch.mockReturnValue(fetchResponse(400, {}));
+    expect(post({ idToken: 'bad', action: 'issue_share' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+  });
+
+  it('requires an ID token to revoke share sessions', () => {
+    mockFetch.mockReturnValue(fetchResponse(400, {}));
+    expect(post({ idToken: 'bad', action: 'revoke_share' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+  });
+
+  it('issues a 30-day share session and stores only its hash', () => {
+    const before = Date.now();
+    mockAllFetches();
+    const result = post({ idToken: 'good', action: 'issue_share' });
+    expect(result.ok).toBe(true);
+    expect(result.ttl_seconds).toBe(30 * 24 * 60 * 60);
+    expect(result.share_token).toMatch(/^[0-9a-f]{64}$/);
+    expect(Date.parse(result.expires_at) - before).toBeGreaterThan(29 * 24 * 60 * 60 * 1000);
+    expect(Date.parse(result.expires_at) - before).toBeLessThanOrEqual(
+      30 * 24 * 60 * 60 * 1000 + 5000
+    );
+    expect(shareValues).toHaveLength(2);
+    expect(shareValues[1][0]).toBe(shareHashOf(result.share_token));
+    expect(shareValues[1][0]).not.toBe(result.share_token);
+    expect(shareValues[1][4]).toBe(0);
+  });
+
+  it('creates the share sheet with headers when it does not exist yet', () => {
+    shareValues = [];
+    shareSheetExists = false;
+    mockAllFetches();
+    const result = post({ idToken: 'good', action: 'issue_share' });
+    expect(result.ok).toBe(true);
+    expect(shareValues[0]).toEqual(SHARE_HEADERS);
+    expect(shareValues).toHaveLength(2);
+  });
+
+  it('revokes the previous session when a new one is issued', () => {
+    const first = issueToken();
+    const second = issueToken();
+    expect(first).not.toBe(second);
+    expect(shareValues[1][3]).not.toBe('');
+    expect(shareValues[2][3]).toBe('');
+    expect(post({ share_token: first, text: 'hi' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+  });
+
+  it('posts with a valid share token and counts the access', () => {
+    const token = issueToken();
+    mockAllFetches();
+    const result = post({ share_token: token, text: 'hi' });
+    expect(result.ok).toBe(true);
+    expect(result.id).toBe('555');
+    expect(result.url).toBe('https://x.com/freddiefujiwara/status/555');
+    expect(result._share.expires_at).toBe(shareValues[1][2]);
+    expect(shareValues[1][4]).toBe(1);
+    expect(shareValues[1][5]).not.toBe('');
+  });
+
+  it('validates a share token without posting', () => {
+    const token = issueToken();
+    mockAllFetches();
+    const result = post({ share_token: token, action: 'validate_share' });
+    expect(result).toEqual({
+      ok: true,
+      _share: { expires_at: shareValues[1][2] },
+    });
+    // Only the issue-time tokeninfo fetch plus none for posting.
+    const postCalls = mockFetch.mock.calls.filter(
+      ([url]) => String(url) === 'https://api.twitter.com/2/tweets'
+    );
+    expect(postCalls).toHaveLength(0);
+  });
+
+  it('rejects an expired share token', () => {
+    const token = 'expired-token';
+    shareValues.push([
+      shareHashOf(token),
+      new Date(Date.now() - 3600_000).toISOString(),
+      new Date(Date.now() - 1800_000).toISOString(),
+      '',
+      0,
+      '',
+    ]);
+    expect(post({ share_token: token, text: 'hi' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+  });
+
+  it('rejects a revoked share token', () => {
+    const token = 'revoked-token';
+    shareValues.push([
+      shareHashOf(token),
+      new Date().toISOString(),
+      new Date(Date.now() + 1800_000).toISOString(),
+      new Date().toISOString(),
+      0,
+      '',
+    ]);
+    expect(post({ share_token: token, text: 'hi' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+  });
+
+  it('rejects an unknown share token', () => {
+    expect(post({ share_token: 'no-such-token', text: 'hi' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+  });
+
+  it('revokes the active session via the revoke action', () => {
+    const token = issueToken();
+    mockAllFetches();
+    expect(post({ idToken: 'good', action: 'revoke_share' })).toEqual({
+      ok: true,
+      revoked: true,
+    });
+    expect(post({ share_token: token, text: 'hi' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
   });
 });
