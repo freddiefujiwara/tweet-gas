@@ -6,7 +6,7 @@ A Google Apps Script (GAS) project that posts tweets to X (@freddiefujiwara).
 
 - Posts a tweet with the X API (`POST /2/tweets`).
 - Signs each request with OAuth 1.0a (HMAC-SHA1). The code makes the signature by itself.
-- Only one person can use the web app. The request must have a Google ID token, and the email in the token must be `zegenvs@gmail.com`.
+- Only one person can use the web app. The request must have a Google ID token, and the email in the token must be the authorized user's email address.
 - After posting, it gets the tweet one more time by ID and checks the text.
 - It writes all API responses to the `log` sheet of the spreadsheet.
 
