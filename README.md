@@ -31,6 +31,8 @@ The API keys are not in the code. Set them in the Apps Script project settings.
 | `X_ACCESS_TOKEN` | Access Token (Read and write) |
 | `X_ACCESS_TOKEN_SECRET` | Access Token Secret |
 | `GOOGLE_CLIENT_ID` | (optional) If set, the ID token must be for this client |
+| `SPREADSHEET_ID` | (optional, staging) Open this spreadsheet by ID instead of the container spreadsheet |
+| `DRY_RUN` | (optional, staging) `1` / `true` = never call the X API; posting returns a synthetic dry-run result (no X credentials needed) |
 
 ## Setup
 

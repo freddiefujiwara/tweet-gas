@@ -35,8 +35,26 @@ export const SHARE_HEADERS = [
   'last_accessed_at',
 ];
 
+// --- Environment separation (staging) ---
+// Optional Script Properties; when unset, behavior is identical to the
+// original production setup:
+// - SPREADSHEET_ID: open this spreadsheet by ID instead of the container
+//   spreadsheet, so a standalone staging project can use its own file.
+// - DRY_RUN ('1' / 'true'): never call the X API. Posting returns a
+//   synthetic result so the whole flow can be exercised safely.
+
+function spreadsheet_() {
+  const id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  return id ? SpreadsheetApp.openById(id) : SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function isDryRun_() {
+  const value = PropertiesService.getScriptProperties().getProperty('DRY_RUN');
+  return value === '1' || value === 'true';
+}
+
 function getShareSheet() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = spreadsheet_();
   let sheet = ss.getSheetByName(SHARE_SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(SHARE_SHEET_NAME);
@@ -135,7 +153,7 @@ function validateShareToken(token) {
  */
 export function logToSheet(action, detail) {
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ss = spreadsheet_();
     let sheet = ss.getSheetByName(LOG_SHEET_NAME);
     if (!sheet) {
       sheet = ss.insertSheet(LOG_SHEET_NAME);
@@ -277,6 +295,9 @@ export function postTweet(text) {
   if (!text || typeof text !== 'string' || text.trim() === '') {
     throw new Error('text is empty');
   }
+  if (isDryRun_()) {
+    return { id: 'dry-run', text, url: null, dry_run: true };
+  }
   const credentials = getCredentials();
   const url = `${API_BASE}/tweets`;
   const authorization = buildAuthorizationHeader(
@@ -404,7 +425,7 @@ export function doPost(e) {
       });
     }
     const posted = postTweet(body.text);
-    const verified = getTweet(posted.id);
+    const verified = posted.dry_run ? { id: posted.id, text: posted.text } : getTweet(posted.id);
     const result = {
       ok: true,
       id: posted.id,
@@ -412,6 +433,9 @@ export function doPost(e) {
       postedText: posted.text,
       verifiedText: verified ? verified.text : null,
     };
+    if (posted.dry_run) {
+      result.dry_run = true;
+    }
     if (shareSession) {
       result._share = { expires_at: shareSession.expires_at };
     }
