@@ -458,3 +458,54 @@ describe('doPost share sessions', () => {
     });
   });
 });
+
+describe('staging environment separation', () => {
+  it('postTweet returns a dry-run result without credentials or an X API call when DRY_RUN=1', () => {
+    mockGetProperty.mockImplementation((name) => (name === 'DRY_RUN' ? '1' : null));
+    const result = Code.postTweet('hello staging');
+    expect(result).toEqual({ id: 'dry-run', text: 'hello staging', url: null, dry_run: true });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('postTweet still posts normally when DRY_RUN is unset', () => {
+    mockFetch.mockReturnValue(fetchResponse(201, { data: { id: '123', text: 'hello' } }));
+    const result = Code.postTweet('hello');
+    expect(result.id).toBe('123');
+    expect(result.dry_run).toBeUndefined();
+  });
+
+  it('logToSheet opens the spreadsheet by SPREADSHEET_ID when set', () => {
+    const byIdSheet = { appendRow: vi.fn() };
+    const openById = vi.fn(() => ({ getSheetByName: () => byIdSheet, insertSheet: () => byIdSheet }));
+    global.SpreadsheetApp = {
+      getActiveSpreadsheet: () => {
+        throw new Error('must not use the container spreadsheet');
+      },
+      openById,
+    };
+    mockGetProperty.mockImplementation((name) => (name === 'SPREADSHEET_ID' ? 'stg-file-id' : null));
+    Code.logToSheet('test', { ok: true });
+    expect(openById).toHaveBeenCalledWith('stg-file-id');
+    expect(byIdSheet.appendRow).toHaveBeenCalled();
+  });
+
+  it('doPost in dry-run mode posts nothing and reports dry_run', () => {
+    const event = (obj) => ({ postData: { contents: JSON.stringify(obj) } });
+    mockGetProperty.mockImplementation((name) => (name === 'DRY_RUN' ? 'true' : null));
+    mockFetch.mockImplementation((url) => {
+      if (String(url).startsWith('https://oauth2.googleapis.com/tokeninfo')) {
+        return fetchResponse(200, { email: 'zegenvs@gmail.com', email_verified: 'true' });
+      }
+      throw new Error('unexpected fetch: ' + url);
+    });
+    const out = Code.doPost(event({ idToken: 'tok', text: 'hello dry' }));
+    expect(JSON.parse(out.text)).toMatchObject({
+      ok: true,
+      id: 'dry-run',
+      dry_run: true,
+      postedText: 'hello dry',
+    });
+    const xCalls = mockFetch.mock.calls.filter(([url]) => String(url).includes('api.twitter.com'));
+    expect(xCalls).toHaveLength(0);
+  });
+});
