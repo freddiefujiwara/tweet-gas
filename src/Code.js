@@ -7,6 +7,11 @@
  * - The web app (doPost) only accepts requests carrying a Google ID token
  *   whose verified email is ALLOWED_EMAIL. Optional Script Property
  *   GOOGLE_CLIENT_ID additionally pins the token audience.
+ * - One machine-to-machine exception: social-gas reads the X numbers
+ *   (followers + recent post metrics) through the "sns_snapshot"
+ *   action, authorized by the SYNC_TOKEN script property — the same
+ *   sync-token pattern alarm-gas uses for the time-table sync. The
+ *   X keys stay in this project; social-gas never holds them.
  */
 
 export const API_BASE = 'https://api.twitter.com/2';
@@ -340,6 +345,164 @@ export function getTweet(id) {
   return { id: json.data.id, text: json.data.text };
 }
 
+// --- Machine sync token (GAS-to-GAS) ---
+// The same pattern alarm-gas uses for the time-table sync: a single
+// long-lived token for machine-to-machine calls, kept only in the
+// SYNC_TOKEN script property, never in code. Here the token is
+// scoped to exactly one read-only action, "sns_snapshot": the
+// caller (social-gas) holds the same value as its
+// TWEET_GAS_SYNC_TOKEN property and POSTs it with the action, and
+// gets the X numbers below back. The token cannot post, issue
+// share links, or do anything else.
+
+export const SYNC_ACTIONS = ['sns_snapshot'];
+
+export function validateSyncToken(token) {
+  if (!token) {
+    return false;
+  }
+  const expected = PropertiesService.getScriptProperties().getProperty('SYNC_TOKEN');
+  return !!expected && String(token) === expected;
+}
+
+// How many of the owner's newest posts the SNS snapshot carries.
+export const SNS_SNAPSHOT_POSTS_LIMIT = 50;
+
+/**
+ * Compact, secret-free summary of an X API error response. Only
+ * the status and the response body's own message fields are used,
+ * so no credential can leak into a log or a caller's snapshot.
+ */
+export function summarizeXApiError(code, text) {
+  let summary = `HTTP ${code}`;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    parsed = null;
+  }
+  const errors = parsed && Array.isArray(parsed.errors) ? parsed.errors : null;
+  if (errors && errors.length) {
+    const first = errors[0] || {};
+    if (first.code !== undefined && first.code !== null) {
+      summary += ` code=${first.code}`;
+    }
+    if (first.message) {
+      summary += `: ${String(first.message).slice(0, 200)}`;
+    }
+  } else if (parsed && parsed.detail) {
+    summary += `: ${String(parsed.detail).slice(0, 200)}`;
+  } else if (parsed && parsed.title) {
+    summary += `: ${String(parsed.title).slice(0, 200)}`;
+  }
+  return summary;
+}
+
+/**
+ * One signed GET against the X API with query parameters. The
+ * query values join the OAuth signature (buildAuthorizationHeader
+ * takes them as request.query) and the request URL.
+ * Returns { code, json, text } like fetchJson.
+ */
+export function signedGet(path, query, credentials) {
+  const baseUrl = `${API_BASE}${path}`;
+  const queryString = Object.entries(query)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join('&');
+  const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
+  const authorization = buildAuthorizationHeader(
+    { method: 'GET', baseUrl, query },
+    credentials
+  );
+  return fetchJson(url, { method: 'get', headers: { Authorization: authorization } });
+}
+
+// A metric value as a number, or null when the API did not report
+// one (absent and non-numeric both read as null, never as 0).
+const xMetricOrNull = (value) => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+
+/**
+ * One post entry of the SNS snapshot, from one tweet object of
+ * GET /2/users/:id/tweets. Counts the API did not report stay null.
+ */
+export function buildSnsSnapshotPost(tweet) {
+  const metrics = (tweet && tweet.public_metrics) || {};
+  return {
+    id: tweet && tweet.id != null ? String(tweet.id) : null,
+    posted_at: (tweet && tweet.created_at) || null,
+    text: tweet && tweet.text != null ? String(tweet.text) : '',
+    views: xMetricOrNull(metrics.impression_count),
+    likes: xMetricOrNull(metrics.like_count),
+    reposts: xMetricOrNull(metrics.retweet_count),
+    replies: xMetricOrNull(metrics.reply_count),
+  };
+}
+
+/**
+ * The X numbers social-gas collects hourly: the owner's follower
+ * count and newest posts with their public metrics, read with the
+ * same OAuth 1.0a credentials this project posts with — the X keys
+ * stay in this project only. The two halves fail independently:
+ * a failed half reports nulls plus a summary in x_error /
+ * posts_error, and the snapshot as a whole still returns ok.
+ * Under DRY_RUN nothing is fetched and every value is null.
+ */
+export function buildSnsSnapshot() {
+  const snapshot = {
+    ok: true,
+    action: 'sns_snapshot',
+    collected_at: new Date().toISOString(),
+    x: { followers: null, username: null, recent_posts: null },
+    x_error: null,
+    posts_error: null,
+  };
+  if (isDryRun_()) {
+    snapshot.dry_run = true;
+    return snapshot;
+  }
+  let credentials;
+  try {
+    credentials = getCredentials();
+  } catch (err) {
+    snapshot.x_error = String(err && err.message ? err.message : err);
+    snapshot.posts_error = snapshot.x_error;
+    return snapshot;
+  }
+  const me = signedGet('/users/me', { 'user.fields': 'public_metrics' }, credentials);
+  const user = me.json && me.json.data ? me.json.data : null;
+  if (me.code < 200 || me.code >= 300 || !user || user.id == null) {
+    snapshot.x_error = `x profile: ${summarizeXApiError(me.code, me.text)}`;
+    snapshot.posts_error = snapshot.x_error;
+    return snapshot;
+  }
+  snapshot.x.username = user.username != null ? String(user.username) : null;
+  snapshot.x.followers = xMetricOrNull(
+    user.public_metrics ? user.public_metrics.followers_count : null
+  );
+  const list = signedGet(
+    `/users/${encodeURIComponent(String(user.id))}/tweets`,
+    {
+      max_results: String(SNS_SNAPSHOT_POSTS_LIMIT),
+      'tweet.fields': 'created_at,public_metrics',
+      exclude: 'retweets,replies',
+    },
+    credentials
+  );
+  const items = list.json && Array.isArray(list.json.data) ? list.json.data : null;
+  if (list.code < 200 || list.code >= 300 || !items) {
+    snapshot.posts_error = `x posts: ${summarizeXApiError(list.code, list.text)}`;
+    return snapshot;
+  }
+  snapshot.x.recent_posts = items.map(buildSnsSnapshotPost);
+  return snapshot;
+}
+
 /**
  * Verifies a Google ID token. Returns the token payload when the token is
  * valid, email-verified, and the email is ALLOWED_EMAIL; otherwise null.
@@ -380,12 +543,41 @@ export function doGet() {
  * - { idToken, action: "revoke_share" }     -> revokes active links.
  * - { share_token, action: "validate_share" } -> checks a link and
  *   returns its expiry as { ok, _share: { expires_at } }.
+ * - { sync_token, action: "sns_snapshot" }  -> the X numbers for
+ *   social-gas (machine-to-machine; see the sync token section).
  * Returns { ok, id, url, postedText, verifiedText } (post) or
  * { ok: false, error }.
  */
 export function doPost(e) {
   try {
     const body = JSON.parse(e.postData.contents);
+    // Machine-to-machine sync (social-gas): the sync token is
+    // checked before every other credential, and it unlocks the
+    // read-only sns_snapshot action only — the same scoping
+    // alarm-gas applies to its sync token.
+    if (body.sync_token) {
+      if (!validateSyncToken(body.sync_token)) {
+        logToSheet('doPost', { ok: false, error: 'sync token invalid' });
+        return jsonOutput({ ok: false, status: 401, error: 'sync token invalid' });
+      }
+      if (!SYNC_ACTIONS.includes(body.action)) {
+        logToSheet('doPost', { ok: false, error: 'sync token may only read the SNS snapshot' });
+        return jsonOutput({
+          ok: false,
+          status: 403,
+          error: 'sync token may only read the SNS snapshot',
+        });
+      }
+      const snapshot = buildSnsSnapshot();
+      logToSheet('sns_snapshot', {
+        ok: true,
+        followers: snapshot.x.followers,
+        posts: Array.isArray(snapshot.x.recent_posts) ? snapshot.x.recent_posts.length : null,
+        x_error: snapshot.x_error,
+        posts_error: snapshot.posts_error,
+      });
+      return jsonOutput({ ...snapshot, _sync: true });
+    }
     if (body.action === 'issue_share' || body.action === 'revoke_share') {
       const identity = verifyIdToken(body.idToken);
       if (!identity) {
