@@ -6,6 +6,7 @@ A Google Apps Script (GAS) project that posts tweets to X (@freddiefujiwara).
 
 - Posts a tweet with the X API (`POST /2/tweets`).
 - Signs each request with OAuth 1.0a (HMAC-SHA1). The code makes the signature by itself.
+- Serves the X numbers (follower count + recent post metrics) to social-gas through the `sns_snapshot` action, authorized by a machine sync token — the same GAS-to-GAS pattern alarm-gas uses for the time-table sync. The X keys stay in this project; social-gas never holds them.
 - Only one person can use the web app. The request must have a Google ID token, and the email in the token must be the authorized user's email address.
 - After posting, it gets the tweet one more time by ID and checks the text.
 - It writes all API responses to the `log` sheet of the spreadsheet.
@@ -30,6 +31,7 @@ The API keys are not in the code. Set them in the Apps Script project settings.
 | `X_CONSUMER_SECRET` | Consumer Secret from the X developer console |
 | `X_ACCESS_TOKEN` | Access Token (Read and write) |
 | `X_ACCESS_TOKEN_SECRET` | Access Token Secret |
+| `SYNC_TOKEN` | Machine sync token for social-gas (the same value as social-gas's `TWEET_GAS_SYNC_TOKEN`). Unlocks the read-only `sns_snapshot` action only |
 | `GOOGLE_CLIENT_ID` | (optional) If set, the ID token must be for this client |
 | `SPREADSHEET_ID` | (optional, staging) Open this spreadsheet by ID instead of the container spreadsheet |
 | `DRY_RUN` | (optional, staging) `1` / `true` = never call the X API; posting returns a synthetic dry-run result (no X credentials needed) |

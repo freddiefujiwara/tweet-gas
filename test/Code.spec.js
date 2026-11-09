@@ -509,3 +509,144 @@ describe('staging environment separation', () => {
     expect(xCalls).toHaveLength(0);
   });
 });
+
+// --- Machine sync token / SNS snapshot --------------------------------
+
+describe('sns_snapshot sync action', () => {
+  const event = (obj) => ({ postData: { contents: JSON.stringify(obj) } });
+  const post = (obj) => JSON.parse(Code.doPost(event(obj)).text);
+
+  const PROPS = {
+    ...KEYS,
+    SYNC_TOKEN: 'sync-secret',
+  };
+
+  const ME = {
+    data: {
+      id: '1234567890',
+      username: 'freddiefujiwara',
+      public_metrics: { followers_count: 321, following_count: 45 },
+    },
+  };
+  const TWEETS = {
+    data: [
+      {
+        id: '2001',
+        created_at: '2026-11-09T10:00:00.000Z',
+        text: '川口のブログを更新しました',
+        public_metrics: {
+          impression_count: 500,
+          like_count: 12,
+          retweet_count: 3,
+          reply_count: 2,
+        },
+      },
+      {
+        id: '2002',
+        created_at: '2026-11-08T10:00:00.000Z',
+        text: '表示回数だけ無い投稿',
+        public_metrics: { like_count: 1, retweet_count: 0, reply_count: 0 },
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    mockGetProperty.mockImplementation((name) => PROPS[name] ?? null);
+  });
+
+  it('rejects a wrong sync token with 401 and never calls the X API', () => {
+    const out = post({ sync_token: 'wrong', action: 'sns_snapshot' });
+    expect(out).toMatchObject({ ok: false, status: 401, error: 'sync token invalid' });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects every other action for the sync token with 403', () => {
+    const out = post({ sync_token: 'sync-secret', text: '投稿されてはいけない' });
+    expect(out).toMatchObject({ ok: false, status: 403 });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects the sync action while SYNC_TOKEN is unset', () => {
+    mockGetProperty.mockImplementation((name) => KEYS[name] ?? null);
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out).toMatchObject({ ok: false, status: 401 });
+  });
+
+  it('returns followers and post metrics for a valid sync call', () => {
+    mockFetch.mockImplementation((url) => {
+      const u = String(url);
+      if (u.startsWith('https://api.twitter.com/2/users/me')) {
+        return fetchResponse(200, ME);
+      }
+      if (u.startsWith('https://api.twitter.com/2/users/1234567890/tweets')) {
+        return fetchResponse(200, TWEETS);
+      }
+      throw new Error('unexpected fetch: ' + u);
+    });
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out.ok).toBe(true);
+    expect(out._sync).toBe(true);
+    expect(out.x.followers).toBe(321);
+    expect(out.x.username).toBe('freddiefujiwara');
+    expect(out.x.recent_posts).toHaveLength(2);
+    expect(out.x.recent_posts[0]).toEqual({
+      id: '2001',
+      posted_at: '2026-11-09T10:00:00.000Z',
+      text: '川口のブログを更新しました',
+      views: 500,
+      likes: 12,
+      reposts: 3,
+      replies: 2,
+    });
+    // A metric the API did not report stays null, never 0.
+    expect(out.x.recent_posts[1].views).toBeNull();
+    expect(out.x_error).toBeNull();
+    expect(out.posts_error).toBeNull();
+    // Both requests are signed (OAuth Authorization header present).
+    for (const [, options] of mockFetch.mock.calls) {
+      expect(options.headers.Authorization).toMatch(/^OAuth /);
+    }
+  });
+
+  it('keeps the followers when the posts fetch fails', () => {
+    mockFetch.mockImplementation((url) => {
+      const u = String(url);
+      if (u.startsWith('https://api.twitter.com/2/users/me')) {
+        return fetchResponse(200, ME);
+      }
+      return fetchResponse(429, {
+        errors: [{ code: 88, message: 'Rate limit exceeded' }],
+      });
+    });
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out.ok).toBe(true);
+    expect(out.x.followers).toBe(321);
+    expect(out.x.recent_posts).toBeNull();
+    expect(out.x_error).toBeNull();
+    expect(out.posts_error).toContain('HTTP 429');
+    expect(out.posts_error).toContain('Rate limit exceeded');
+  });
+
+  it('reports a profile failure on both error fields', () => {
+    mockFetch.mockImplementation(() =>
+      fetchResponse(401, { title: 'Unauthorized', detail: 'bad token' })
+    );
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out.ok).toBe(true);
+    expect(out.x.followers).toBeNull();
+    expect(out.x.recent_posts).toBeNull();
+    expect(out.x_error).toContain('HTTP 401');
+    expect(out.posts_error).toBe(out.x_error);
+  });
+
+  it('returns nulls without fetching under DRY_RUN', () => {
+    mockGetProperty.mockImplementation((name) =>
+      name === 'DRY_RUN' ? '1' : (PROPS[name] ?? null)
+    );
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out.ok).toBe(true);
+    expect(out.dry_run).toBe(true);
+    expect(out.x).toEqual({ followers: null, username: null, recent_posts: null });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
