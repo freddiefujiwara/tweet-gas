@@ -7,6 +7,9 @@
  * - The web app (doPost) only accepts requests carrying a Google ID token
  *   whose verified email is ALLOWED_EMAIL. Optional Script Property
  *   GOOGLE_CLIENT_ID additionally pins the token audience.
+ * - A comment inbox: "list_comments" collects comments on the
+ *   owner's posts into an "inbox" sheet tab, and "reply_comment"
+ *   answers one of them. Both use the normal user auth path below.
  * - One machine-to-machine exception: social-gas reads the X numbers
  *   (followers + recent post metrics) through the "sns_snapshot"
  *   action, authorized by the SYNC_TOKEN script property — the same
@@ -293,13 +296,73 @@ function fetchJson(url, options) {
   return { code, json, text };
 }
 
+// --- Weighted text length (the X 280-character rule) -------------------
+// NOTE: up to afa8b79 this project only checked for empty text; the
+// weighted-length validation the comment inbox needs did not exist
+// here yet. It is implemented once in validateTweetText() below and
+// shared by postTweet() and postReply(), so both posting paths apply
+// exactly the same rule. Weights follow the X counting rules: most
+// Latin / kana code points weigh 1, CJK and emoji weigh 2, and a URL
+// weighs 23 regardless of its raw length.
+
+export const MAX_WEIGHTED_LENGTH = 280;
+export const URL_WEIGHTED_LENGTH = 23;
+
+function codePointWeight_(codePoint) {
+  if (
+    codePoint <= 0x10ff ||
+    (codePoint >= 0x2000 && codePoint <= 0x200d) ||
+    (codePoint >= 0x2010 && codePoint <= 0x201f) ||
+    (codePoint >= 0x2032 && codePoint <= 0x2037)
+  ) {
+    return 1;
+  }
+  return 2;
+}
+
+/**
+ * The X weighted length of a text: URLs count as
+ * URL_WEIGHTED_LENGTH each, every other code point as 1 or 2.
+ */
+export function weightedTweetLength(text) {
+  const raw = String(text == null ? '' : text);
+  let length = 0;
+  let rest = raw;
+  const urlPattern = /https?:\/\/[^\s]+/g;
+  let match = urlPattern.exec(raw);
+  while (match) {
+    length += URL_WEIGHTED_LENGTH;
+    rest = rest.replace(match[0], '');
+    match = urlPattern.exec(raw);
+  }
+  for (const ch of rest) {
+    length += codePointWeight_(ch.codePointAt(0));
+  }
+  return length;
+}
+
+/**
+ * Shared text validation for posts and replies: non-empty and
+ * within the weighted 280 limit. Throws on invalid text.
+ */
+export function validateTweetText(text) {
+  if (!text || typeof text !== 'string' || text.trim() === '') {
+    throw new Error('text is empty');
+  }
+  const length = weightedTweetLength(text);
+  if (length > MAX_WEIGHTED_LENGTH) {
+    throw new Error(
+      `text is too long: weighted length ${length} exceeds ${MAX_WEIGHTED_LENGTH}`
+    );
+  }
+  return text;
+}
+
 /**
  * Posts a tweet. Returns { id, text, url }.
  */
 export function postTweet(text) {
-  if (!text || typeof text !== 'string' || text.trim() === '') {
-    throw new Error('text is empty');
-  }
+  validateTweetText(text);
   if (isDryRun_()) {
     return { id: 'dry-run', text, url: null, dry_run: true };
   }
@@ -503,6 +566,410 @@ export function buildSnsSnapshot() {
   return snapshot;
 }
 
+// --- Comment inbox ------------------------------------------------------
+// Two user-authenticated actions (the same Google ID token / share
+// session path as posting; the sync token can NOT reach them — it is
+// scoped to sns_snapshot only):
+// - "list_comments": collect comments on the owner's posts from the
+//   mentions timeline plus a per-conversation recent search, store
+//   them in the "inbox" sheet, and return them newest first.
+// - "reply_comment": post a reply to one stored comment and mark
+//   the inbox row as replied.
+// Authorization caveat: mentions and especially the recent-search
+// endpoint are not available on every X API plan/tier, and an app
+// without the right access gets 401/403 for them. list_comments
+// therefore treats search failure as a degraded result (mentions
+// only, plus a note) instead of failing the whole action.
+
+export const INBOX_SHEET_NAME = 'inbox';
+export const INBOX_HEADERS = [
+  'comment_id',
+  'author_id',
+  'author_username',
+  'author_name',
+  'text',
+  'created_at',
+  'in_reply_to_tweet_id',
+  'conversation_id',
+  'status',
+  'our_reply_id',
+  'first_seen_at',
+  'last_seen_at',
+];
+// 1-based column numbers in the inbox sheet, matching INBOX_HEADERS.
+const INBOX_COL_STATUS = 9;
+const INBOX_COL_OUR_REPLY_ID = 10;
+const INBOX_COL_LAST_SEEN_AT = 12;
+
+export const INBOX_MENTIONS_MAX_RESULTS = 100;
+// The conversation search costs one search request per own post,
+// and recent search is the most quota-sensitive endpoint here, so
+// the targets are capped at the newest posts of the last 7 days:
+// at most INBOX_SEARCH_POSTS_LIMIT search calls per list_comments
+// run, which keeps a polling frontend from draining the quota while
+// still covering the window where new comments realistically land.
+export const INBOX_SEARCH_WINDOW_DAYS = 7;
+export const INBOX_SEARCH_POSTS_LIMIT = 10;
+export const INBOX_SEARCH_MAX_RESULTS = 100;
+
+const INBOX_TWEET_FIELDS = 'created_at,conversation_id,in_reply_to_user_id,referenced_tweets';
+
+function getInboxSheet() {
+  const ss = spreadsheet_();
+  let sheet = ss.getSheetByName(INBOX_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(INBOX_SHEET_NAME);
+    sheet.appendRow(INBOX_HEADERS);
+  }
+  return sheet;
+}
+
+function usersByIdFromIncludes_(json) {
+  const users = {};
+  const list =
+    json && json.includes && Array.isArray(json.includes.users) ? json.includes.users : [];
+  list.forEach((user) => {
+    if (user && user.id != null) {
+      users[String(user.id)] = {
+        username: user.username != null ? String(user.username) : '',
+        name: user.name != null ? String(user.name) : '',
+      };
+    }
+  });
+  return users;
+}
+
+/**
+ * Normalizes one raw X tweet object into an inbox comment, or
+ * returns null for items the inbox must not carry: the owner's own
+ * posts and reposts (referenced_tweets with type "retweeted", plus
+ * the legacy "RT @" text prefix when references are absent).
+ */
+export function normalizeInboxComment(tweet, usersById, ownId) {
+  if (!tweet || tweet.id == null) {
+    return null;
+  }
+  const authorId = tweet.author_id != null ? String(tweet.author_id) : '';
+  if (authorId && String(ownId) === authorId) {
+    return null;
+  }
+  const referenced = Array.isArray(tweet.referenced_tweets) ? tweet.referenced_tweets : [];
+  if (referenced.some((ref) => ref && ref.type === 'retweeted')) {
+    return null;
+  }
+  const text = tweet.text != null ? String(tweet.text) : '';
+  if (referenced.length === 0 && text.startsWith('RT @')) {
+    return null;
+  }
+  const repliedTo = referenced.find((ref) => ref && ref.type === 'replied_to');
+  const author = (usersById && usersById[authorId]) || {};
+  return {
+    comment_id: String(tweet.id),
+    author_id: authorId,
+    author_username: author.username || '',
+    author_name: author.name || '',
+    text,
+    created_at: tweet.created_at || '',
+    in_reply_to_tweet_id: repliedTo && repliedTo.id != null ? String(repliedTo.id) : '',
+    conversation_id: tweet.conversation_id != null ? String(tweet.conversation_id) : '',
+  };
+}
+
+function normalizeInboxComments_(json, ownId) {
+  const usersById = usersByIdFromIncludes_(json);
+  const items = json && Array.isArray(json.data) ? json.data : [];
+  return items
+    .map((tweet) => normalizeInboxComment(tweet, usersById, ownId))
+    .filter((comment) => comment !== null);
+}
+
+/**
+ * Chooses the owner's posts whose conversations get a reply
+ * search: newest first, only those created within the last
+ * INBOX_SEARCH_WINDOW_DAYS days, capped at
+ * INBOX_SEARCH_POSTS_LIMIT (see the constant's comment for why).
+ */
+export function selectConversationSearchTargets(posts, nowMs) {
+  const cutoff = nowMs - INBOX_SEARCH_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  return (Array.isArray(posts) ? posts : [])
+    .filter((post) => post && post.id != null && post.created_at)
+    .map((post) => ({ id: String(post.id), createdMs: Date.parse(post.created_at) }))
+    .filter((post) => Number.isFinite(post.createdMs) && post.createdMs >= cutoff)
+    .sort((a, b) => b.createdMs - a.createdMs)
+    .slice(0, INBOX_SEARCH_POSTS_LIMIT)
+    .map((post) => post.id);
+}
+
+/**
+ * Upserts comments into the inbox sheet and returns them with
+ * their stored status / our_reply_id merged in. Existing rows
+ * keep status, our_reply_id and first_seen_at untouched; only the
+ * descriptive fields and last_seen_at are refreshed, so collecting
+ * again can never un-reply a comment that was already answered.
+ * Storage failures are swallowed like logToSheet failures (the
+ * caller still gets the freshly collected comments, all "new").
+ */
+export function upsertInboxComments(comments) {
+  const nowIso = new Date().toISOString();
+  let existingById = new Map();
+  let sheet = null;
+  try {
+    sheet = getInboxSheet();
+    const values = sheet.getDataRange().getValues();
+    values.forEach((row, index) => {
+      if (index > 0 && row[0] != null && row[0] !== '') {
+        existingById.set(String(row[0]), { row, rowNumber: index + 1 });
+      }
+    });
+  } catch (e) {
+    sheet = null;
+    existingById = new Map();
+  }
+  return (Array.isArray(comments) ? comments : []).map((comment) => {
+    const existing = existingById.get(comment.comment_id);
+    const merged = {
+      ...comment,
+      status: existing ? String(existing.row[INBOX_COL_STATUS - 1] || 'new') : 'new',
+      our_reply_id: existing ? String(existing.row[INBOX_COL_OUR_REPLY_ID - 1] || '') : '',
+    };
+    if (!sheet) {
+      return merged;
+    }
+    try {
+      if (existing) {
+        const refresh = [
+          [2, comment.author_id],
+          [3, comment.author_username],
+          [4, comment.author_name],
+          [5, comment.text],
+          [6, comment.created_at],
+          [7, comment.in_reply_to_tweet_id],
+          [8, comment.conversation_id],
+          [INBOX_COL_LAST_SEEN_AT, nowIso],
+        ];
+        refresh.forEach(([col, value]) => {
+          sheet.getRange(existing.rowNumber, col).setValue(value);
+        });
+      } else {
+        sheet.appendRow([
+          comment.comment_id,
+          comment.author_id,
+          comment.author_username,
+          comment.author_name,
+          comment.text,
+          comment.created_at,
+          comment.in_reply_to_tweet_id,
+          comment.conversation_id,
+          'new',
+          '',
+          nowIso,
+          nowIso,
+        ]);
+      }
+    } catch (e) {
+      // one bad row must not lose the rest of the batch
+    }
+    return merged;
+  });
+}
+
+function publicInboxComment_(comment) {
+  return {
+    comment_id: comment.comment_id,
+    author_id: comment.author_id,
+    author_username: comment.author_username,
+    author_name: comment.author_name,
+    text: comment.text,
+    created_at: comment.created_at,
+    in_reply_to_tweet_id: comment.in_reply_to_tweet_id,
+    conversation_id: comment.conversation_id,
+    status: comment.status,
+    our_reply_id: comment.our_reply_id,
+  };
+}
+
+/**
+ * Backs the "list_comments" action. Returns
+ * { ok: true, comments: [...newest first], note? }.
+ * Mentions failure throws (the action then reports ok:false via
+ * doPost); search failure only degrades to mentions with a note.
+ * Under DRY_RUN the X API is never called.
+ */
+export function listComments() {
+  if (isDryRun_()) {
+    return { ok: true, dry_run: true, comments: [] };
+  }
+  const credentials = getCredentials();
+  const me = signedGet('/users/me', {}, credentials);
+  const meData = me.json && me.json.data ? me.json.data : null;
+  if (me.code < 200 || me.code >= 300 || !meData || meData.id == null) {
+    throw new Error(`X API profile failed: ${summarizeXApiError(me.code, me.text)}`);
+  }
+  const ownId = String(meData.id);
+
+  const mentions = signedGet(
+    `/users/${encodeURIComponent(ownId)}/mentions`,
+    {
+      max_results: String(INBOX_MENTIONS_MAX_RESULTS),
+      expansions: 'author_id',
+      'tweet.fields': INBOX_TWEET_FIELDS,
+    },
+    credentials
+  );
+  if (mentions.code < 200 || mentions.code >= 300 || !mentions.json) {
+    throw new Error(`X API mentions failed: ${summarizeXApiError(mentions.code, mentions.text)}`);
+  }
+  const byId = new Map();
+  normalizeInboxComments_(mentions.json, ownId).forEach((comment) => {
+    byId.set(comment.comment_id, comment);
+  });
+
+  // Second source: direct replies to the owner's recent posts,
+  // which the mentions timeline can miss (e.g. when the reply does
+  // not @-mention the owner). Any failure here — the endpoint is
+  // plan-gated, so 401/403 is expected on tiers without search —
+  // degrades to the mentions result instead of failing the action.
+  let note = null;
+  const ownPosts = signedGet(
+    `/users/${encodeURIComponent(ownId)}/tweets`,
+    {
+      max_results: '100',
+      exclude: 'retweets,replies',
+      'tweet.fields': 'created_at',
+    },
+    credentials
+  );
+  const ownItems =
+    ownPosts.code >= 200 && ownPosts.code < 300 && ownPosts.json && Array.isArray(ownPosts.json.data)
+      ? ownPosts.json.data
+      : null;
+  if (!ownItems) {
+    note = 'conversation reply search unavailable; showing mentions only';
+  } else {
+    const targets = selectConversationSearchTargets(ownItems, Date.now());
+    let searchFailed = false;
+    targets.forEach((postId) => {
+      const found = signedGet(
+        '/tweets/search/recent',
+        {
+          query: `conversation_id:${postId} is:reply`,
+          max_results: String(INBOX_SEARCH_MAX_RESULTS),
+          expansions: 'author_id',
+          'tweet.fields': INBOX_TWEET_FIELDS,
+        },
+        credentials
+      );
+      if (found.code < 200 || found.code >= 300 || !found.json) {
+        searchFailed = true;
+        return;
+      }
+      normalizeInboxComments_(found.json, ownId).forEach((comment) => {
+        if (!byId.has(comment.comment_id)) {
+          byId.set(comment.comment_id, comment);
+        }
+      });
+    });
+    if (searchFailed) {
+      note = 'conversation reply search failed for some posts; results may be incomplete';
+    }
+  }
+
+  const stored = upsertInboxComments([...byId.values()]);
+  stored.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+  const result = { ok: true, comments: stored.map(publicInboxComment_) };
+  if (note) {
+    result.note = note;
+  }
+  return result;
+}
+
+/**
+ * Posts a reply to the tweet commentId. Same shape and DRY_RUN
+ * behavior as postTweet. Returns { id, text, url }.
+ */
+export function postReply(text, commentId) {
+  validateTweetText(text);
+  if (!commentId || String(commentId).trim() === '') {
+    throw new Error('comment_id is empty');
+  }
+  if (isDryRun_()) {
+    return { id: 'dry-run', text, url: null, dry_run: true };
+  }
+  const credentials = getCredentials();
+  const url = `${API_BASE}/tweets`;
+  const authorization = buildAuthorizationHeader(
+    { method: 'POST', baseUrl: url },
+    credentials
+  );
+  const { code, json, text: body } = fetchJson(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: authorization },
+    payload: JSON.stringify({
+      text,
+      reply: { in_reply_to_tweet_id: String(commentId) },
+    }),
+  });
+  if (code < 200 || code >= 300 || !json || !json.data || !json.data.id) {
+    throw new Error(`X API post failed (${code}): ${body}`);
+  }
+  return {
+    id: json.data.id,
+    text: json.data.text,
+    url: `https://x.com/${SCREEN_NAME}/status/${json.data.id}`,
+  };
+}
+
+/**
+ * Marks one inbox row as replied and records our reply's id.
+ * Returns true when a matching row was found. Storage failures
+ * are swallowed (false) so a posted reply is never reported as
+ * failed just because the bookkeeping write failed.
+ */
+export function markInboxCommentReplied(commentId, replyId) {
+  try {
+    const sheet = getInboxSheet();
+    const values = sheet.getDataRange().getValues();
+    for (let index = 1; index < values.length; index += 1) {
+      if (String(values[index][0]) === String(commentId)) {
+        sheet.getRange(index + 1, INBOX_COL_STATUS).setValue('replied');
+        sheet.getRange(index + 1, INBOX_COL_OUR_REPLY_ID).setValue(String(replyId));
+        return true;
+      }
+    }
+  } catch (e) {
+    // ignore bookkeeping failures
+  }
+  return false;
+}
+
+/**
+ * Backs the "reply_comment" action: validates the text with the
+ * shared weighted-length rule, posts the reply, verifies it with
+ * GET /2/tweets/:id exactly like the plain post flow, then marks
+ * the inbox row replied. Under DRY_RUN nothing is posted and the
+ * inbox row is left untouched.
+ */
+export function replyToComment(commentId, text) {
+  const posted = postReply(text, commentId);
+  const verified = posted.dry_run ? { id: posted.id, text: posted.text } : getTweet(posted.id);
+  const result = {
+    ok: true,
+    id: posted.id,
+    url: posted.url,
+    postedText: posted.text,
+    verifiedText: verified ? verified.text : null,
+    comment_id: String(commentId),
+    in_reply_to_tweet_id: String(commentId),
+  };
+  if (posted.dry_run) {
+    result.dry_run = true;
+    return result;
+  }
+  result.inbox_updated = markInboxCommentReplied(commentId, posted.id);
+  return result;
+}
+
 /**
  * Verifies a Google ID token. Returns the token payload when the token is
  * valid, email-verified, and the email is ALLOWED_EMAIL; otherwise null.
@@ -545,6 +1012,10 @@ export function doGet() {
  *   returns its expiry as { ok, _share: { expires_at } }.
  * - { sync_token, action: "sns_snapshot" }  -> the X numbers for
  *   social-gas (machine-to-machine; see the sync token section).
+ * - { idToken|share_token, action: "list_comments" } -> comments on
+ *   the owner's posts, collected into the "inbox" sheet.
+ * - { idToken|share_token, action: "reply_comment", comment_id,
+ *   text } -> posts a reply to that comment and marks it replied.
  * Returns { ok, id, url, postedText, verifiedText } (post) or
  * { ok: false, error }.
  */
@@ -615,6 +1086,34 @@ export function doPost(e) {
         ok: true,
         _share: { expires_at: shareSession.expires_at },
       });
+    }
+    if (body.action === 'list_comments' || body.action === 'reply_comment') {
+      // Comment inbox: reached only through the user auth path
+      // above (Google ID token or share session) — the sync token
+      // was already rejected for anything but sns_snapshot.
+      const actor = identity ? identity.email : '(share link)';
+      if (body.action === 'list_comments') {
+        const inbox = listComments();
+        const result = { ...inbox };
+        if (shareSession) {
+          result._share = { expires_at: shareSession.expires_at };
+        }
+        logToSheet('list_comments', {
+          email: actor,
+          ok: true,
+          count: inbox.comments.length,
+          note: inbox.note || null,
+          dry_run: !!inbox.dry_run,
+        });
+        return jsonOutput(result);
+      }
+      const replied = replyToComment(body.comment_id, body.text);
+      const result = { ...replied };
+      if (shareSession) {
+        result._share = { expires_at: shareSession.expires_at };
+      }
+      logToSheet('reply_comment', { email: actor, ...result });
+      return jsonOutput(result);
     }
     const posted = postTweet(body.text);
     const verified = posted.dry_run ? { id: posted.id, text: posted.text } : getTweet(posted.id);
