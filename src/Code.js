@@ -1151,3 +1151,93 @@ export function postTestTweet() {
   Logger.log(JSON.stringify(result));
   return result;
 }
+
+// --- DM access probe (phase 2 prerequisite) ---
+// Editor-only check: can the current X credentials read the DM
+// endpoints at all? The answer decides whether a DM inbox
+// (phase 2) can reuse the existing OAuth 1.0a keys, or whether the
+// app permission has to include Direct Messages and the access
+// token be re-issued. This is deliberately NOT a doPost action, so
+// no new web-reachable surface is added. No DM content is ever
+// read out, logged or returned: only the HTTP status and, on
+// failure, the error title/detail the API itself returns.
+
+export const DM_EVENTS_URL = 'https://api.x.com/2/dm_events';
+
+/**
+ * Reduces one dm_events response to { status, ok } plus, on
+ * success, only how many events came back (the events themselves
+ * are discarded unread) and, on failure, only the error
+ * title/detail.
+ */
+export function summarizeDmProbeResponse(code, text) {
+  const result = { status: code, ok: code >= 200 && code < 300 };
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    parsed = null;
+  }
+  if (!parsed) {
+    return result;
+  }
+  if (result.ok) {
+    if (Array.isArray(parsed.data)) {
+      result.count = parsed.data.length;
+    }
+    return result;
+  }
+  if (parsed.title) {
+    result.title = String(parsed.title).slice(0, 200);
+  }
+  if (parsed.detail) {
+    result.detail = String(parsed.detail).slice(0, 200);
+  }
+  if (
+    !result.title &&
+    !result.detail &&
+    Array.isArray(parsed.errors) &&
+    parsed.errors.length
+  ) {
+    const first = parsed.errors[0] || {};
+    if (first.message) {
+      result.detail = String(first.message).slice(0, 200);
+    }
+  }
+  return result;
+}
+
+/**
+ * Manual probe from the Apps Script editor: one signed GET of
+ * GET /2/dm_events?max_results=1 with the existing credentials.
+ * Under DRY_RUN the X API is never called. The fetch bypasses
+ * fetchJson() on purpose: that helper logs the full response body
+ * to the log sheet, and a DM response body must never be stored
+ * anywhere. Only the status summary reaches the Logger, the
+ * return value and the log sheet.
+ */
+export function probeDmAccess() {
+  if (isDryRun_()) {
+    const result = { dry_run: true };
+    Logger.log(JSON.stringify(result));
+    return result;
+  }
+  const credentials = getCredentials();
+  const query = { max_results: 1 };
+  const authorization = buildAuthorizationHeader(
+    { method: 'GET', baseUrl: DM_EVENTS_URL, query },
+    credentials
+  );
+  const response = UrlFetchApp.fetch(`${DM_EVENTS_URL}?max_results=1`, {
+    method: 'get',
+    headers: { Authorization: authorization },
+    muteHttpExceptions: true,
+  });
+  const result = summarizeDmProbeResponse(
+    response.getResponseCode(),
+    response.getContentText()
+  );
+  logToSheet('probe_dm_access', { status: result.status, ok: result.ok });
+  Logger.log(JSON.stringify(result));
+  return result;
+}

@@ -650,3 +650,93 @@ describe('sns_snapshot sync action', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 });
+
+// --- DM access probe -------------------------------------------------
+
+describe('probeDmAccess', () => {
+  const DM_BODY = {
+    data: [
+      {
+        id: 'dm-event-1',
+        event_type: 'JoinConversation',
+        text: 'SECRET DM TEXT',
+        sender_id: '4242424242',
+        dm_conversation_id: 'conv-987654321',
+      },
+    ],
+    meta: { result_count: 1 },
+  };
+
+  it('calls dm_events once, signed, and returns only status/ok/count on 200', () => {
+    mockFetch.mockReturnValue(fetchResponse(200, DM_BODY));
+    const result = Code.probeDmAccess();
+    expect(result).toEqual({ status: 200, ok: true, count: 1 });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe('https://api.x.com/2/dm_events?max_results=1');
+    expect(options.method).toBe('get');
+    expect(options.headers.Authorization).toMatch(/^OAuth /);
+  });
+
+  it('never leaks DM content into the result, the Logger or the log sheet', () => {
+    mockFetch.mockReturnValue(fetchResponse(200, DM_BODY));
+    const result = Code.probeDmAccess();
+    const surfaces =
+      JSON.stringify(result) +
+      JSON.stringify(appendedRows) +
+      JSON.stringify(Logger.log.mock.calls);
+    expect(surfaces).not.toContain('SECRET DM TEXT');
+    expect(surfaces).not.toContain('4242424242');
+    expect(surfaces).not.toContain('conv-987654321');
+    expect(surfaces).not.toContain('dm-event-1');
+  });
+
+  it('extracts only the error title/detail on 403', () => {
+    mockFetch.mockReturnValue(
+      fetchResponse(403, {
+        title: 'Forbidden',
+        detail: 'This endpoint is not accessible with the current app permission',
+        resource_id: 'must-not-be-copied',
+      })
+    );
+    const result = Code.probeDmAccess();
+    expect(result).toEqual({
+      status: 403,
+      ok: false,
+      title: 'Forbidden',
+      detail: 'This endpoint is not accessible with the current app permission',
+    });
+    expect(JSON.stringify(result)).not.toContain('must-not-be-copied');
+  });
+
+  it('falls back to errors[0].message when title/detail are absent', () => {
+    mockFetch.mockReturnValue(
+      fetchResponse(403, { errors: [{ code: 200, message: 'Forbidden.' }] })
+    );
+    const result = Code.probeDmAccess();
+    expect(result).toEqual({ status: 403, ok: false, detail: 'Forbidden.' });
+  });
+
+  it('never calls the X API under DRY_RUN', () => {
+    mockGetProperty.mockImplementation((name) => (name === 'DRY_RUN' ? '1' : null));
+    const result = Code.probeDmAccess();
+    expect(result).toEqual({ dry_run: true });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('summarizeDmProbeResponse', () => {
+  it('omits count when a 200 body has no data array', () => {
+    expect(Code.summarizeDmProbeResponse(200, '{"meta":{"result_count":0}}')).toEqual({
+      status: 200,
+      ok: true,
+    });
+  });
+
+  it('tolerates a non-JSON error body', () => {
+    expect(Code.summarizeDmProbeResponse(500, 'oops')).toEqual({
+      status: 500,
+      ok: false,
+    });
+  });
+});
