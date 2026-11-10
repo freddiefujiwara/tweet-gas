@@ -199,6 +199,11 @@ function routeFetch(overrides = {}) {
     if (u.includes('/mentions')) {
       return overrides.mentions || fetchResponse(200, MENTIONS);
     }
+    if (u.includes('/quote_tweets')) {
+      return overrides.quote
+        ? overrides.quote(u)
+        : fetchResponse(200, { data: [] });
+    }
     if (u.includes('/tweets/search/recent')) {
       return overrides.search
         ? overrides.search(u)
@@ -249,6 +254,10 @@ describe('normalizeInboxComment', () => {
       created_at: MENTIONS.data[0].created_at,
       in_reply_to_tweet_id: '900',
       conversation_id: '900',
+      // The mention fixture replies to post 900, so its kind is
+      // "reply" (the shape gained the kind field with the quote
+      // source; see the kind tests below).
+      kind: 'reply',
     });
   });
 
@@ -506,6 +515,353 @@ describe('reply_comment action', () => {
       text: 'ありがとうございます！',
     });
     expect(out).toMatchObject({ ok: true, dry_run: true, id: 'dry-run' });
+    expect(xCalls()).toHaveLength(0);
+    const row = inboxRowFor('1001');
+    expect(row[8]).toBe('new');
+    expect(row[9]).toBe('');
+  });
+});
+
+// --- Quote source (third collection path) --------------------------------
+
+const OWN_POSTS_QUOTED = {
+  data: [
+    {
+      id: '900',
+      created_at: daysAgo(1),
+      text: '一昨日の投稿',
+      public_metrics: { quote_count: 3, retweet_count: 0, reply_count: 1 },
+    },
+  ],
+};
+
+const QUOTE_RESULTS = {
+  data: [
+    {
+      id: '3001',
+      author_id: '555',
+      text: 'これは参考になる',
+      created_at: hoursAgo(0.5),
+      conversation_id: '3001',
+      referenced_tweets: [{ type: 'quoted', id: '900' }],
+    },
+    {
+      // A quote with no text of its own: the quote itself counts.
+      id: '3002',
+      author_id: '666',
+      text: '',
+      created_at: hoursAgo(4),
+      conversation_id: '3002',
+      referenced_tweets: [{ type: 'quoted', id: '900' }],
+    },
+    {
+      // The same tweet id as the mention/search hit 1001, this
+      // time also quoting post 900: deduplicated, kind upgraded.
+      id: '1001',
+      author_id: '222',
+      text: '@freddiefujiwara 参考になりました！',
+      created_at: hoursAgo(2),
+      conversation_id: '900',
+      referenced_tweets: [
+        { type: 'replied_to', id: '900' },
+        { type: 'quoted', id: '900' },
+      ],
+    },
+  ],
+  includes: {
+    users: [
+      { id: '555', username: 'eve', name: 'Eve E' },
+      { id: '666', username: 'frank', name: 'Frank F' },
+      { id: '222', username: 'alice', name: 'Alice A' },
+    ],
+  },
+};
+
+const quoteCalls = () =>
+  mockFetch.mock.calls.filter(([url]) => String(url).includes('/quote_tweets'));
+
+describe('kind determination', () => {
+  const base = {
+    id: '4001',
+    author_id: '222',
+    text: 'x',
+    created_at: hoursAgo(1),
+    conversation_id: '4001',
+  };
+
+  it('prefers quote when a tweet both replies to and quotes an own post', () => {
+    const tweet = {
+      ...base,
+      referenced_tweets: [
+        { type: 'replied_to', id: '900' },
+        { type: 'quoted', id: '900' },
+      ],
+    };
+    const comment = Code.normalizeInboxComment(tweet, {}, '111', {
+      ownPostIds: ['900', '901'],
+    });
+    expect(comment.kind).toBe('quote');
+    expect(Code.determineInboxKind(tweet, ['900'], 'reply')).toBe('quote');
+  });
+
+  it('does not call a quote of someone else a quote kind', () => {
+    const tweet = {
+      ...base,
+      referenced_tweets: [
+        { type: 'replied_to', id: '900' },
+        { type: 'quoted', id: '999' },
+      ],
+    };
+    expect(Code.determineInboxKind(tweet, ['900'])).toBe('reply');
+  });
+
+  it('classifies a plain mention as mention and a plain reply as reply', () => {
+    expect(Code.normalizeInboxComment({ ...base }, {}, '111').kind).toBe('mention');
+    const reply = {
+      ...base,
+      referenced_tweets: [{ type: 'replied_to', id: '900' }],
+    };
+    expect(Code.normalizeInboxComment(reply, {}, '111').kind).toBe('reply');
+  });
+});
+
+describe('selectQuoteTargets', () => {
+  it('keeps only quoted posts inside the 30-day window, newest first', () => {
+    const posts = [
+      { id: 'a', created_at: daysAgo(10), public_metrics: { quote_count: 0 } },
+      { id: 'b', created_at: daysAgo(20), public_metrics: { quote_count: 2 } },
+      { id: 'c', created_at: daysAgo(5), public_metrics: { quote_count: 1 } },
+      { id: 'd', created_at: daysAgo(40), public_metrics: { quote_count: 9 } },
+      { id: 'e', created_at: daysAgo(3) },
+    ];
+    expect(Code.selectQuoteTargets(posts, Date.now())).toEqual(['c', 'b']);
+  });
+
+  it('considers at most 15 posts and caps the calls at 10', () => {
+    const posts = [];
+    for (let i = 0; i < 20; i += 1) {
+      posts.push({
+        id: String(2000 + i),
+        created_at: hoursAgo(i + 1),
+        public_metrics: { quote_count: 1 },
+      });
+    }
+    const targets = Code.selectQuoteTargets(posts, Date.now());
+    expect(targets).toHaveLength(Code.INBOX_QUOTE_CALLS_LIMIT);
+    expect(targets[0]).toBe('2000');
+  });
+});
+
+describe('list_comments quote source', () => {
+  it('merges quotes, deduplicates by tweet id, and records kind', () => {
+    routeFetch({
+      ownPosts: fetchResponse(200, OWN_POSTS_QUOTED),
+      quote: () => fetchResponse(200, QUOTE_RESULTS),
+    });
+    const out = post({ idToken: 'good', action: 'list_comments' });
+    expect(out.ok).toBe(true);
+    expect(out.note).toBeUndefined();
+    // Newest first; the text-less quote (3002) is included, and
+    // 1001 appears exactly once although three sources returned it.
+    expect(out.comments.map((c) => c.comment_id)).toEqual(['3001', '1004', '1001', '3002']);
+    const byCommentId = Object.fromEntries(out.comments.map((c) => [c.comment_id, c]));
+    expect(byCommentId['3001'].kind).toBe('quote');
+    expect(byCommentId['3002'].kind).toBe('quote');
+    expect(byCommentId['3002'].text).toBe('');
+    expect(byCommentId['1004'].kind).toBe('reply');
+    // Quote wins for the tweet that also arrived as a reply.
+    expect(byCommentId['1001'].kind).toBe('quote');
+    // Exactly one quote_tweets call, for post 900, with the
+    // required expansions and fields.
+    expect(quoteCalls()).toHaveLength(1);
+    const quoteUrl = String(quoteCalls()[0][0]);
+    expect(quoteUrl).toContain('/tweets/900/quote_tweets');
+    expect(quoteUrl).toContain('expansions=author_id');
+    expect(quoteUrl).toContain('referenced_tweets');
+    // The kind is stored as the last inbox column.
+    expect(sheets.get('inbox').values[0]).toEqual(Code.INBOX_HEADERS);
+    expect(Code.INBOX_HEADERS[12]).toBe('kind');
+    expect(inboxRowFor('3001')[12]).toBe('quote');
+    expect(inboxRowFor('1001')[12]).toBe('quote');
+  });
+
+  it('does not call quote_tweets for posts with quote_count 0', () => {
+    routeFetch({
+      ownPosts: fetchResponse(200, {
+        data: [
+          { id: '900', created_at: daysAgo(1), public_metrics: { quote_count: 0 } },
+          { id: '901', created_at: daysAgo(2), public_metrics: {} },
+        ],
+      }),
+    });
+    const out = post({ idToken: 'good', action: 'list_comments' });
+    expect(out.ok).toBe(true);
+    expect(quoteCalls()).toHaveLength(0);
+  });
+
+  it('caps quote_tweets calls at 10 even when many posts are quoted', () => {
+    const posts = [];
+    for (let i = 0; i < 15; i += 1) {
+      posts.push({
+        // 8..22 days old: inside the 30-day quote window but
+        // outside the 7-day conversation search window.
+        id: String(5000 + i),
+        created_at: daysAgo(8 + i),
+        public_metrics: { quote_count: 1 },
+      });
+    }
+    routeFetch({ ownPosts: fetchResponse(200, { data: posts }) });
+    const out = post({ idToken: 'good', action: 'list_comments' });
+    expect(out.ok).toBe(true);
+    expect(quoteCalls()).toHaveLength(Code.INBOX_QUOTE_CALLS_LIMIT);
+  });
+
+  it('degrades with a note when the quote endpoint fails', () => {
+    routeFetch({
+      ownPosts: fetchResponse(200, OWN_POSTS_QUOTED),
+      quote: () => fetchResponse(403, { errors: [{ message: 'forbidden' }] }),
+    });
+    const out = post({ idToken: 'good', action: 'list_comments' });
+    expect(out.ok).toBe(true);
+    // Mentions plus conversation replies are still returned.
+    expect(out.comments.map((c) => c.comment_id)).toEqual(['1004', '1001']);
+    expect(out.note).toMatch(/quote/);
+  });
+});
+
+describe('upsertInboxComments kind handling', () => {
+  const commentWithKind = (kind) => ({
+    comment_id: '1001',
+    author_id: '222',
+    author_username: 'alice',
+    author_name: 'Alice A',
+    text: 'text',
+    created_at: hoursAgo(5),
+    in_reply_to_tweet_id: '900',
+    conversation_id: '900',
+    kind,
+  });
+
+  it('never erases or downgrades a stored kind on re-collection', () => {
+    seedInbox([
+      ['1001', '222', 'alice', 'Alice A', 'old text', hoursAgo(5), '900', '900',
+        'replied', '2000', hoursAgo(5), hoursAgo(5), 'quote'],
+    ]);
+    const [merged] = Code.upsertInboxComments([commentWithKind('mention')]);
+    expect(merged.kind).toBe('quote');
+    expect(merged.status).toBe('replied');
+    expect(inboxRowFor('1001')[12]).toBe('quote');
+  });
+
+  it('fills the kind of a legacy row whose kind cell is still empty', () => {
+    // A pre-kind row: only the original 12 columns are present.
+    seedInbox([
+      ['1001', '222', 'alice', 'Alice A', 'old text', hoursAgo(5), '900', '900',
+        'new', '', hoursAgo(5), hoursAgo(5)],
+    ]);
+    const [merged] = Code.upsertInboxComments([commentWithKind('quote')]);
+    expect(merged.kind).toBe('quote');
+    expect(inboxRowFor('1001')[12]).toBe('quote');
+  });
+
+  it('adds the kind header to a sheet created before the column existed', () => {
+    const sheet = makeSheet('inbox');
+    sheet.values = [
+      [...Code.INBOX_HEADERS.slice(0, 12)],
+      ['1001', '222', 'alice', 'Alice A', 'old text', hoursAgo(5), '900', '900',
+        'new', '', hoursAgo(5), hoursAgo(5)],
+    ];
+    sheets.set('inbox', sheet);
+    Code.upsertInboxComments([commentWithKind('quote')]);
+    expect(sheet.values[0]).toEqual(Code.INBOX_HEADERS);
+    expect(inboxRowFor('1001')[12]).toBe('quote');
+  });
+
+  it('writes the kind when appending a new row', () => {
+    const [merged] = Code.upsertInboxComments([commentWithKind('quote')]);
+    expect(merged.kind).toBe('quote');
+    const row = inboxRowFor('1001');
+    expect(row).toHaveLength(13);
+    expect(row[12]).toBe('quote');
+  });
+});
+
+// --- reply_comment with as_quote ------------------------------------------
+
+describe('reply_comment action with as_quote', () => {
+  const seedRow = () =>
+    seedInbox([
+      ['1001', '222', 'alice', 'Alice A', 'コメント', hoursAgo(3), '900', '900',
+        'new', '', hoursAgo(3), hoursAgo(3)],
+    ]);
+
+  it('posts a quote payload (quote_tweet_id, no reply), verifies and marks replied', () => {
+    seedRow();
+    routeFetch();
+    const out = post({
+      idToken: 'good',
+      action: 'reply_comment',
+      comment_id: '1001',
+      text: 'ありがとうございます！',
+      as_quote: true,
+    });
+    expect(out.ok).toBe(true);
+    expect(out.id).toBe('2001');
+    expect(out.as_quote).toBe(true);
+    expect(out.quote_tweet_id).toBe('1001');
+    expect(out.in_reply_to_tweet_id).toBeUndefined();
+    expect(out.verifiedText).toBe('ありがとうございます！');
+    const postCall = mockFetch.mock.calls.find(
+      ([url, options]) =>
+        String(url) === 'https://api.twitter.com/2/tweets' && options.method === 'post'
+    );
+    const payload = JSON.parse(postCall[1].payload);
+    expect(payload).toEqual({
+      text: 'ありがとうございます！',
+      quote_tweet_id: '1001',
+    });
+    expect(payload).not.toHaveProperty('reply');
+    const row = inboxRowFor('1001');
+    expect(row[8]).toBe('replied');
+    expect(row[9]).toBe('2001');
+  });
+
+  it('rejects over-280 text in quote mode without calling X', () => {
+    seedRow();
+    routeFetch();
+    const out = post({
+      idToken: 'good',
+      action: 'reply_comment',
+      comment_id: '1001',
+      text: 'a'.repeat(281),
+      as_quote: true,
+    });
+    expect(out.ok).toBe(false);
+    expect(out.error).toMatch(/too long/);
+    expect(xCalls()).toHaveLength(0);
+    expect(inboxRowFor('1001')[8]).toBe('new');
+  });
+
+  it('in dry-run mode quotes nothing and leaves the inbox row untouched', () => {
+    seedRow();
+    mockGetProperty.mockImplementation((name) =>
+      name === 'DRY_RUN' ? 'true' : (KEYS[name] ?? null)
+    );
+    routeFetch();
+    const out = post({
+      idToken: 'good',
+      action: 'reply_comment',
+      comment_id: '1001',
+      text: 'ありがとうございます！',
+      as_quote: true,
+    });
+    expect(out).toMatchObject({
+      ok: true,
+      dry_run: true,
+      id: 'dry-run',
+      as_quote: true,
+      quote_tweet_id: '1001',
+    });
     expect(xCalls()).toHaveLength(0);
     const row = inboxRowFor('1001');
     expect(row[8]).toBe('new');

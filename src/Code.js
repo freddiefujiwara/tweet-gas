@@ -576,15 +576,19 @@ export function buildSnsSnapshot() {
 // session path as posting; the sync token can NOT reach them — it is
 // scoped to sns_snapshot only):
 // - "list_comments": collect comments on the owner's posts from the
-//   mentions timeline plus a per-conversation recent search, store
-//   them in the "inbox" sheet, and return them newest first.
+//   mentions timeline, a per-conversation recent search, and the
+//   quote tweets of the owner's recent quoted posts, store them in
+//   the "inbox" sheet, and return them newest first. Every comment
+//   carries a "kind" (mention / reply / quote; quote wins whenever a
+//   tweet quotes one of the owner's posts).
 // - "reply_comment": post a reply to one stored comment and mark
-//   the inbox row as replied.
+//   the inbox row as replied. With as_quote it quotes the comment
+//   instead of replying to it.
 // Authorization caveat: mentions and especially the recent-search
 // endpoint are not available on every X API plan/tier, and an app
 // without the right access gets 401/403 for them. list_comments
-// therefore treats search failure as a degraded result (mentions
-// only, plus a note) instead of failing the whole action.
+// therefore treats search and quote failures as degraded results
+// (the other sources, plus a note) instead of failing the action.
 
 export const INBOX_SHEET_NAME = 'inbox';
 export const INBOX_HEADERS = [
@@ -600,11 +604,21 @@ export const INBOX_HEADERS = [
   'our_reply_id',
   'first_seen_at',
   'last_seen_at',
+  'kind',
 ];
 // 1-based column numbers in the inbox sheet, matching INBOX_HEADERS.
 const INBOX_COL_STATUS = 9;
 const INBOX_COL_OUR_REPLY_ID = 10;
 const INBOX_COL_LAST_SEEN_AT = 12;
+const INBOX_COL_KIND = 13;
+
+// The three comment kinds stored in the inbox "kind" column.
+export const INBOX_KINDS = ['mention', 'reply', 'quote'];
+// Priority when the same tweet is seen through several sources (or
+// a stored row already carries a kind): quote beats reply beats
+// mention, so a kind once recorded is never downgraded or erased
+// by a later collection.
+const INBOX_KIND_PRIORITY_ = { mention: 1, reply: 2, quote: 3 };
 
 export const INBOX_MENTIONS_MAX_RESULTS = 100;
 // The conversation search costs one search request per own post,
@@ -616,6 +630,16 @@ export const INBOX_MENTIONS_MAX_RESULTS = 100;
 export const INBOX_SEARCH_WINDOW_DAYS = 7;
 export const INBOX_SEARCH_POSTS_LIMIT = 10;
 export const INBOX_SEARCH_MAX_RESULTS = 100;
+// Third source: quote tweets. Only the owner's newest posts of the
+// last 30 days (at most INBOX_QUOTE_POSTS_LIMIT of them) are even
+// considered, only those whose public_metrics report quote_count
+// > 0 are queried, and the quote_tweets calls themselves are
+// capped at INBOX_QUOTE_CALLS_LIMIT per list_comments run, so the
+// quote source stays bounded like the conversation search.
+export const INBOX_QUOTE_WINDOW_DAYS = 30;
+export const INBOX_QUOTE_POSTS_LIMIT = 15;
+export const INBOX_QUOTE_CALLS_LIMIT = 10;
+export const INBOX_QUOTE_MAX_RESULTS = 100;
 
 const INBOX_TWEET_FIELDS = 'created_at,conversation_id,in_reply_to_user_id,referenced_tweets';
 
@@ -625,8 +649,88 @@ function getInboxSheet() {
   if (!sheet) {
     sheet = ss.insertSheet(INBOX_SHEET_NAME);
     sheet.appendRow(INBOX_HEADERS);
+    return sheet;
+  }
+  // Migrate a pre-kind sheet in place: rows written before the
+  // "kind" column existed simply have no value in it, which the
+  // rest of the inbox treats as the legacy (mention/reply) kind.
+  try {
+    const values = sheet.getDataRange().getValues();
+    const header = values && values.length > 0 ? values[0] : null;
+    if (header && header.length < INBOX_HEADERS.length) {
+      for (let col = header.length + 1; col <= INBOX_HEADERS.length; col += 1) {
+        sheet.getRange(1, col).setValue(INBOX_HEADERS[col - 1]);
+      }
+    }
+  } catch (e) {
+    // header migration must never break collection
   }
   return sheet;
+}
+
+/**
+ * The kind of one inbox comment. A referenced_tweets entry of
+ * type "quoted" that points at one of the owner's own posts makes
+ * it a quote, and that wins over every other signal (including a
+ * "replied_to" reference on the same tweet and the source the
+ * tweet was collected through). Without a quote reference the
+ * source kind wins when one is given, then a "replied_to"
+ * reference makes it a reply, and anything else is a mention.
+ * ownPostIds may be an array/Set of the owner's post ids, or null
+ * when they are unknown (then any "quoted" reference counts).
+ */
+export function determineInboxKind(tweet, ownPostIds, sourceKind) {
+  const referenced =
+    tweet && Array.isArray(tweet.referenced_tweets) ? tweet.referenced_tweets : [];
+  const ownSet =
+    ownPostIds == null
+      ? null
+      : new Set((Array.isArray(ownPostIds) ? ownPostIds : [...ownPostIds]).map(String));
+  const quotesOwnPost = referenced.some(
+    (ref) =>
+      ref &&
+      ref.type === 'quoted' &&
+      ref.id != null &&
+      (ownSet === null || ownSet.has(String(ref.id)))
+  );
+  if (quotesOwnPost) {
+    return 'quote';
+  }
+  if (sourceKind && INBOX_KINDS.includes(sourceKind)) {
+    return sourceKind;
+  }
+  if (referenced.some((ref) => ref && ref.type === 'replied_to')) {
+    return 'reply';
+  }
+  return 'mention';
+}
+
+// The higher-priority kind of two (possibly empty) kinds, or ''
+// when neither is a known kind. Used so a stored kind is never
+// erased or downgraded by a re-collection (see INBOX_KIND_PRIORITY_).
+function mergeInboxKind_(existingKind, newKind) {
+  const existing = INBOX_KINDS.includes(existingKind) ? existingKind : '';
+  const incoming = INBOX_KINDS.includes(newKind) ? newKind : '';
+  if (!existing) {
+    return incoming;
+  }
+  if (!incoming) {
+    return existing;
+  }
+  return INBOX_KIND_PRIORITY_[incoming] > INBOX_KIND_PRIORITY_[existing]
+    ? incoming
+    : existing;
+}
+
+// The kind a comment is reported with: its recorded kind, or —
+// for a legacy row whose kind cell is still empty — the kind it
+// would have carried before the column existed (a reply when it
+// replies to a tweet, a mention otherwise).
+function publicInboxKind_(comment) {
+  if (comment && INBOX_KINDS.includes(comment.kind)) {
+    return comment.kind;
+  }
+  return comment && comment.in_reply_to_tweet_id ? 'reply' : 'mention';
 }
 
 function usersByIdFromIncludes_(json) {
@@ -649,8 +753,11 @@ function usersByIdFromIncludes_(json) {
  * returns null for items the inbox must not carry: the owner's own
  * posts and reposts (referenced_tweets with type "retweeted", plus
  * the legacy "RT @" text prefix when references are absent).
+ * A tweet with no text at all still counts when it reaches here
+ * through the quote source: the quote itself is the comment.
+ * options: { ownPostIds, sourceKind } — see determineInboxKind.
  */
-export function normalizeInboxComment(tweet, usersById, ownId) {
+export function normalizeInboxComment(tweet, usersById, ownId, options = {}) {
   if (!tweet || tweet.id == null) {
     return null;
   }
@@ -677,14 +784,15 @@ export function normalizeInboxComment(tweet, usersById, ownId) {
     created_at: tweet.created_at || '',
     in_reply_to_tweet_id: repliedTo && repliedTo.id != null ? String(repliedTo.id) : '',
     conversation_id: tweet.conversation_id != null ? String(tweet.conversation_id) : '',
+    kind: determineInboxKind(tweet, options.ownPostIds, options.sourceKind),
   };
 }
 
-function normalizeInboxComments_(json, ownId) {
+function normalizeInboxComments_(json, ownId, options = {}) {
   const usersById = usersByIdFromIncludes_(json);
   const items = json && Array.isArray(json.data) ? json.data : [];
   return items
-    .map((tweet) => normalizeInboxComment(tweet, usersById, ownId))
+    .map((tweet) => normalizeInboxComment(tweet, usersById, ownId, options))
     .filter((comment) => comment !== null);
 }
 
@@ -702,6 +810,32 @@ export function selectConversationSearchTargets(posts, nowMs) {
     .filter((post) => Number.isFinite(post.createdMs) && post.createdMs >= cutoff)
     .sort((a, b) => b.createdMs - a.createdMs)
     .slice(0, INBOX_SEARCH_POSTS_LIMIT)
+    .map((post) => post.id);
+}
+
+/**
+ * Chooses the owner's posts whose quote tweets get fetched:
+ * newest first, only those created within the last
+ * INBOX_QUOTE_WINDOW_DAYS days, at most INBOX_QUOTE_POSTS_LIMIT
+ * posts are considered, only posts whose public_metrics report
+ * quote_count > 0 are kept, and the result is capped at
+ * INBOX_QUOTE_CALLS_LIMIT so a list_comments run never makes
+ * more quote_tweets calls than that.
+ */
+export function selectQuoteTargets(posts, nowMs) {
+  const cutoff = nowMs - INBOX_QUOTE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  return (Array.isArray(posts) ? posts : [])
+    .filter((post) => post && post.id != null && post.created_at)
+    .map((post) => ({
+      id: String(post.id),
+      createdMs: Date.parse(post.created_at),
+      quoteCount: xMetricOrNull(post.public_metrics ? post.public_metrics.quote_count : null),
+    }))
+    .filter((post) => Number.isFinite(post.createdMs) && post.createdMs >= cutoff)
+    .sort((a, b) => b.createdMs - a.createdMs)
+    .slice(0, INBOX_QUOTE_POSTS_LIMIT)
+    .filter((post) => post.quoteCount != null && post.quoteCount > 0)
+    .slice(0, INBOX_QUOTE_CALLS_LIMIT)
     .map((post) => post.id);
 }
 
@@ -732,10 +866,25 @@ export function upsertInboxComments(comments) {
   }
   return (Array.isArray(comments) ? comments : []).map((comment) => {
     const existing = existingById.get(comment.comment_id);
+    // The kind is merged by priority and never taken from a single
+    // side alone: a stored "quote" survives a later mention/reply
+    // re-collection, a legacy row (kind still empty) adopts the
+    // freshly determined kind, and a kind-less incoming comment
+    // (direct callers of this function) falls back to the kind its
+    // reply reference implies.
+    const incomingKind = INBOX_KINDS.includes(comment.kind)
+      ? comment.kind
+      : comment.in_reply_to_tweet_id
+        ? 'reply'
+        : 'mention';
     const merged = {
       ...comment,
       status: existing ? String(existing.row[INBOX_COL_STATUS - 1] || 'new') : 'new',
       our_reply_id: existing ? String(existing.row[INBOX_COL_OUR_REPLY_ID - 1] || '') : '',
+      kind: mergeInboxKind_(
+        existing ? String(existing.row[INBOX_COL_KIND - 1] || '') : '',
+        incomingKind
+      ),
     };
     if (!sheet) {
       return merged;
@@ -751,6 +900,7 @@ export function upsertInboxComments(comments) {
           [7, comment.in_reply_to_tweet_id],
           [8, comment.conversation_id],
           [INBOX_COL_LAST_SEEN_AT, nowIso],
+          [INBOX_COL_KIND, merged.kind],
         ];
         refresh.forEach(([col, value]) => {
           sheet.getRange(existing.rowNumber, col).setValue(value);
@@ -769,6 +919,7 @@ export function upsertInboxComments(comments) {
           '',
           nowIso,
           nowIso,
+          merged.kind,
         ]);
       }
     } catch (e) {
@@ -790,6 +941,7 @@ function publicInboxComment_(comment) {
     conversation_id: comment.conversation_id,
     status: comment.status,
     our_reply_id: comment.our_reply_id,
+    kind: publicInboxKind_(comment),
   };
 }
 
@@ -797,7 +949,7 @@ function publicInboxComment_(comment) {
  * Backs the "list_comments" action. Returns
  * { ok: true, comments: [...newest first], note? }.
  * Mentions failure throws (the action then reports ok:false via
- * doPost); search failure only degrades to mentions with a note.
+ * doPost); search and quote failures only degrade with a note.
  * Under DRY_RUN the X API is never called.
  */
 export function listComments() {
@@ -812,6 +964,27 @@ export function listComments() {
   }
   const ownId = String(meData.id);
 
+  // The owner's own posts are fetched first (one call shared by
+  // the conversation search and the quote source): their ids are
+  // what lets a "quoted" reference be recognized as quoting the
+  // owner, and their public_metrics carry the quote counts. A
+  // failure here only degrades the two per-post sources below —
+  // the mentions timeline further down stands on its own.
+  const ownPosts = signedGet(
+    `/users/${encodeURIComponent(ownId)}/tweets`,
+    {
+      max_results: '100',
+      exclude: 'retweets,replies',
+      'tweet.fields': 'created_at,public_metrics',
+    },
+    credentials
+  );
+  const ownItems =
+    ownPosts.code >= 200 && ownPosts.code < 300 && ownPosts.json && Array.isArray(ownPosts.json.data)
+      ? ownPosts.json.data
+      : null;
+  const ownPostIds = ownItems ? ownItems.map((post) => String(post.id)) : null;
+
   const mentions = signedGet(
     `/users/${encodeURIComponent(ownId)}/mentions`,
     {
@@ -825,31 +998,33 @@ export function listComments() {
     throw new Error(`X API mentions failed: ${summarizeXApiError(mentions.code, mentions.text)}`);
   }
   const byId = new Map();
-  normalizeInboxComments_(mentions.json, ownId).forEach((comment) => {
-    byId.set(comment.comment_id, comment);
-  });
+  // Merges one collected comment into the map: a tweet seen
+  // through several sources is kept once, and its kind is the
+  // highest-priority kind any source determined for it.
+  const addComment = (comment) => {
+    const existing = byId.get(comment.comment_id);
+    if (!existing) {
+      byId.set(comment.comment_id, comment);
+      return;
+    }
+    const kind = mergeInboxKind_(existing.kind, comment.kind);
+    if (kind !== existing.kind) {
+      byId.set(comment.comment_id, { ...existing, kind });
+    }
+  };
+  normalizeInboxComments_(mentions.json, ownId, { ownPostIds }).forEach(addComment);
 
   // Second source: direct replies to the owner's recent posts,
   // which the mentions timeline can miss (e.g. when the reply does
   // not @-mention the owner). Any failure here — the endpoint is
   // plan-gated, so 401/403 is expected on tiers without search —
   // degrades to the mentions result instead of failing the action.
-  let note = null;
-  const ownPosts = signedGet(
-    `/users/${encodeURIComponent(ownId)}/tweets`,
-    {
-      max_results: '100',
-      exclude: 'retweets,replies',
-      'tweet.fields': 'created_at',
-    },
-    credentials
-  );
-  const ownItems =
-    ownPosts.code >= 200 && ownPosts.code < 300 && ownPosts.json && Array.isArray(ownPosts.json.data)
-      ? ownPosts.json.data
-      : null;
+  // Third source: quote tweets of the owner's recent quoted posts.
+  // It degrades the same way, independently of the search source.
+  const notes = [];
   if (!ownItems) {
-    note = 'conversation reply search unavailable; showing mentions only';
+    notes.push('conversation reply search unavailable; showing mentions only');
+    notes.push('quote search unavailable; quotes may be missing');
   } else {
     const targets = selectConversationSearchTargets(ownItems, Date.now());
     let searchFailed = false;
@@ -868,22 +1043,43 @@ export function listComments() {
         searchFailed = true;
         return;
       }
-      normalizeInboxComments_(found.json, ownId).forEach((comment) => {
-        if (!byId.has(comment.comment_id)) {
-          byId.set(comment.comment_id, comment);
-        }
-      });
+      normalizeInboxComments_(found.json, ownId, { ownPostIds }).forEach(addComment);
     });
     if (searchFailed) {
-      note = 'conversation reply search failed for some posts; results may be incomplete';
+      notes.push('conversation reply search failed for some posts; results may be incomplete');
+    }
+
+    const quoteTargets = selectQuoteTargets(ownItems, Date.now());
+    let quoteFailed = false;
+    quoteTargets.forEach((postId) => {
+      const found = signedGet(
+        `/tweets/${encodeURIComponent(postId)}/quote_tweets`,
+        {
+          max_results: String(INBOX_QUOTE_MAX_RESULTS),
+          expansions: 'author_id',
+          'tweet.fields': INBOX_TWEET_FIELDS,
+        },
+        credentials
+      );
+      if (found.code < 200 || found.code >= 300 || !found.json) {
+        quoteFailed = true;
+        return;
+      }
+      normalizeInboxComments_(found.json, ownId, {
+        ownPostIds,
+        sourceKind: 'quote',
+      }).forEach(addComment);
+    });
+    if (quoteFailed) {
+      notes.push('quote search failed for some posts; results may be incomplete');
     }
   }
 
   const stored = upsertInboxComments([...byId.values()]);
   stored.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
   const result = { ok: true, comments: stored.map(publicInboxComment_) };
-  if (note) {
-    result.note = note;
+  if (notes.length > 0) {
+    result.note = notes.join('; ');
   }
   return result;
 }
@@ -891,8 +1087,10 @@ export function listComments() {
 /**
  * Posts a reply to the tweet commentId. Same shape and DRY_RUN
  * behavior as postTweet. Returns { id, text, url }.
+ * With options.asQuote the post quotes commentId instead:
+ * the payload carries quote_tweet_id and no reply object at all.
  */
-export function postReply(text, commentId) {
+export function postReply(text, commentId, options = {}) {
   validateTweetText(text);
   if (!commentId || String(commentId).trim() === '') {
     throw new Error('comment_id is empty');
@@ -910,10 +1108,12 @@ export function postReply(text, commentId) {
     method: 'post',
     contentType: 'application/json',
     headers: { Authorization: authorization },
-    payload: JSON.stringify({
-      text,
-      reply: { in_reply_to_tweet_id: String(commentId) },
-    }),
+    payload: options.asQuote
+      ? JSON.stringify({ text, quote_tweet_id: String(commentId) })
+      : JSON.stringify({
+          text,
+          reply: { in_reply_to_tweet_id: String(commentId) },
+        }),
   });
   if (code < 200 || code >= 300 || !json || !json.data || !json.data.id) {
     throw new Error(`X API post failed (${code}): ${body}`);
@@ -952,11 +1152,16 @@ export function markInboxCommentReplied(commentId, replyId) {
  * Backs the "reply_comment" action: validates the text with the
  * shared weighted-length rule, posts the reply, verifies it with
  * GET /2/tweets/:id exactly like the plain post flow, then marks
- * the inbox row replied. Under DRY_RUN nothing is posted and the
- * inbox row is left untouched.
+ * the inbox row replied. With options.asQuote the post quotes the
+ * comment instead of replying to it; verification and the inbox
+ * update are exactly the same, and the result carries
+ * quote_tweet_id (and as_quote) instead of in_reply_to_tweet_id.
+ * Under DRY_RUN nothing is posted and the inbox row is left
+ * untouched.
  */
-export function replyToComment(commentId, text) {
-  const posted = postReply(text, commentId);
+export function replyToComment(commentId, text, options = {}) {
+  const asQuote = !!(options && options.asQuote);
+  const posted = postReply(text, commentId, { asQuote });
   const verified = posted.dry_run ? { id: posted.id, text: posted.text } : getTweet(posted.id);
   const result = {
     ok: true,
@@ -965,8 +1170,13 @@ export function replyToComment(commentId, text) {
     postedText: posted.text,
     verifiedText: verified ? verified.text : null,
     comment_id: String(commentId),
-    in_reply_to_tweet_id: String(commentId),
   };
+  if (asQuote) {
+    result.as_quote = true;
+    result.quote_tweet_id = String(commentId);
+  } else {
+    result.in_reply_to_tweet_id = String(commentId);
+  }
   if (posted.dry_run) {
     result.dry_run = true;
     return result;
@@ -1620,7 +1830,8 @@ export function doGet() {
  * - { idToken|share_token, action: "list_comments" } -> comments on
  *   the owner's posts, collected into the "inbox" sheet.
  * - { idToken|share_token, action: "reply_comment", comment_id,
- *   text } -> posts a reply to that comment and marks it replied.
+ *   text, as_quote? } -> posts a reply to that comment and marks
+ *   it replied; with as_quote: true it quotes the comment instead.
  * - { idToken|share_token, action: "list_dms" } -> DM events
  *   collected into the "dm" sheet, grouped into conversations.
  * - { idToken|share_token, action: "mark_dm_read", conversation_id,
@@ -1758,7 +1969,9 @@ export function doPost(e) {
         });
         return jsonOutput(result);
       }
-      const replied = replyToComment(body.comment_id, body.text);
+      const replied = replyToComment(body.comment_id, body.text, {
+        asQuote: body.as_quote === true,
+      });
       const result = { ...replied };
       if (shareSession) {
         result._share = { expires_at: shareSession.expires_at };
