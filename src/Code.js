@@ -10,6 +10,11 @@
  * - A comment inbox: "list_comments" collects comments on the
  *   owner's posts into an "inbox" sheet tab, and "reply_comment"
  *   answers one of them. Both use the normal user auth path below.
+ * - A DM inbox: "list_dms" collects direct-message events into a
+ *   "dm" sheet tab (with a separate "dm_state" tab for the
+ *   read/replied markers), "mark_dm_read" advances the read
+ *   marker, and "reply_dm" answers a conversation. Same user
+ *   auth path as the comment inbox.
  * - One machine-to-machine exception: social-gas reads the X numbers
  *   (followers + recent post metrics) through the "sns_snapshot"
  *   action, authorized by the SYNC_TOKEN script property — the same
@@ -970,6 +975,606 @@ export function replyToComment(commentId, text) {
   return result;
 }
 
+// --- DM inbox -----------------------------------------------------------
+// Three more user-authenticated actions (the same Google ID token /
+// share session path as the comment inbox; the sync token can NOT
+// reach them — it is scoped to sns_snapshot only):
+// - "list_dms": fetch the newest DM events (GET /2/dm_events,
+//   MessageCreate only, at most DM_EVENTS_MAX_PAGES pages), upsert
+//   them into the "dm" sheet, and return them grouped into
+//   conversations, newest conversation first.
+// - "mark_dm_read": advance a conversation's read marker.
+// - "reply_dm": send one DM into a conversation and advance both
+//   the read and replied markers to the sent event.
+// Storage mirrors the comment inbox: per the owner's explicit
+// decision the "dm" tab keeps the full message text, exactly like
+// the "inbox" tab keeps comment text. Read/replied markers live in
+// the separate "dm_state" tab, so re-collecting events can never
+// clobber them (the inbox folds the same state into its status
+// column instead, because a comment's reply is itself a tweet).
+
+export const DM_SHEET_NAME = 'dm';
+export const DM_HEADERS = [
+  'event_id',
+  'conversation_id',
+  'sender_id',
+  'sender_username',
+  'sender_name',
+  'text',
+  'created_at',
+  'is_mine',
+  'first_seen_at',
+  'last_seen_at',
+];
+// 1-based column numbers in the dm sheet, matching DM_HEADERS.
+const DM_COL_LAST_SEEN_AT = 10;
+
+export const DM_STATE_SHEET_NAME = 'dm_state';
+export const DM_STATE_HEADERS = [
+  'conversation_id',
+  'last_read_event_id',
+  'last_replied_event_id',
+  'updated_at',
+];
+// 1-based column numbers in the dm_state sheet.
+const DM_STATE_COL_LAST_READ = 2;
+const DM_STATE_COL_LAST_REPLIED = 3;
+const DM_STATE_COL_UPDATED_AT = 4;
+
+export const DM_EVENTS_MAX_RESULTS = 100;
+// The events endpoint is polled by the frontend, so fetching is
+// capped at two pages (200 events) per list_dms run no matter how
+// many next_tokens the API offers.
+export const DM_EVENTS_MAX_PAGES = 2;
+// Each conversation carries at most this many newest messages.
+export const DM_MESSAGES_PER_CONVERSATION = 20;
+// DM texts allow far more than a tweet: the limit here is a plain
+// code-point count (NOT the weighted 280 rule), per the API
+// contract agreed with the frontend.
+export const DM_REPLY_MAX_CODE_POINTS = 10000;
+
+function getDmSheet() {
+  const ss = spreadsheet_();
+  let sheet = ss.getSheetByName(DM_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(DM_SHEET_NAME);
+    sheet.appendRow(DM_HEADERS);
+  }
+  return sheet;
+}
+
+function getDmStateSheet() {
+  const ss = spreadsheet_();
+  let sheet = ss.getSheetByName(DM_STATE_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(DM_STATE_SHEET_NAME);
+    sheet.appendRow(DM_STATE_HEADERS);
+  }
+  return sheet;
+}
+
+/**
+ * Compares two X event ids as numeric strings. X ids exceed
+ * Number.MAX_SAFE_INTEGER, so the comparison goes through BigInt
+ * (with a length-then-lexicographic fallback for non-numeric ids)
+ * instead of ever falling back to Number, where distinct ids can
+ * collapse into the same value. Returns -1, 0 or 1.
+ */
+export function compareDmEventIds(a, b) {
+  const sa = a == null ? '' : String(a);
+  const sb = b == null ? '' : String(b);
+  if (sa === sb) {
+    return 0;
+  }
+  try {
+    const ba = BigInt(sa);
+    const bb = BigInt(sb);
+    return ba < bb ? -1 : 1;
+  } catch (e) {
+    if (sa.length !== sb.length) {
+      return sa.length < sb.length ? -1 : 1;
+    }
+    return sa < sb ? -1 : 1;
+  }
+}
+
+// Chronological order for DM messages: created_at first, the
+// numeric event id breaks ties (and a missing created_at).
+function compareDmMessages_(a, b) {
+  const ca = a.created_at || '';
+  const cb = b.created_at || '';
+  if (ca !== cb) {
+    return ca < cb ? -1 : 1;
+  }
+  return compareDmEventIds(a.event_id, b.event_id);
+}
+
+// User lookup for DM payloads. Unlike the inbox variant, absent
+// names/usernames stay null: the DM API contract types them as
+// string|null, not as empty strings.
+function dmUsersById_(json) {
+  const users = {};
+  const list =
+    json && json.includes && Array.isArray(json.includes.users) ? json.includes.users : [];
+  list.forEach((user) => {
+    if (user && user.id != null) {
+      users[String(user.id)] = {
+        username: user.username != null ? String(user.username) : null,
+        name: user.name != null ? String(user.name) : null,
+      };
+    }
+  });
+  return users;
+}
+
+/**
+ * Normalizes one raw dm_events item into a DM message, or returns
+ * null for items that cannot be a message: no id, no conversation
+ * id, or an event_type other than MessageCreate (the request asks
+ * for MessageCreate only, but the filter is re-applied here so a
+ * stray event type can never enter the sheet). The returned
+ * object also carries participant_ids for conversation grouping;
+ * publicDmMessage_ strips it from API responses.
+ */
+export function normalizeDmEvent(raw, usersById, ownId) {
+  if (!raw || raw.id == null || raw.dm_conversation_id == null) {
+    return null;
+  }
+  if (raw.event_type && raw.event_type !== 'MessageCreate') {
+    return null;
+  }
+  const senderId = raw.sender_id != null ? String(raw.sender_id) : '';
+  const sender = (usersById && usersById[senderId]) || {};
+  return {
+    event_id: String(raw.id),
+    conversation_id: String(raw.dm_conversation_id),
+    sender_id: senderId,
+    sender_username: sender.username != null ? sender.username : null,
+    sender_name: sender.name != null ? sender.name : null,
+    text: raw.text != null ? String(raw.text) : '',
+    created_at: raw.created_at || '',
+    is_mine: senderId !== '' && String(ownId) === senderId,
+    participant_ids: Array.isArray(raw.participant_ids)
+      ? raw.participant_ids.map((id) => String(id))
+      : [],
+  };
+}
+
+function publicDmMessage_(message) {
+  return {
+    event_id: message.event_id,
+    conversation_id: message.conversation_id,
+    sender_id: message.sender_id,
+    sender_username: message.sender_username != null ? message.sender_username : null,
+    sender_name: message.sender_name != null ? message.sender_name : null,
+    text: message.text,
+    created_at: message.created_at,
+    is_mine: !!message.is_mine,
+  };
+}
+
+/**
+ * Upserts DM events into the "dm" sheet, keyed by event_id.
+ * Existing rows keep first_seen_at; the descriptive fields and
+ * last_seen_at are refreshed, so re-collecting never duplicates a
+ * row. Storage failures are swallowed like logToSheet failures.
+ */
+export function upsertDmEvents(events) {
+  const nowIso = new Date().toISOString();
+  let sheet = null;
+  const existingById = new Map();
+  try {
+    sheet = getDmSheet();
+    const values = sheet.getDataRange().getValues();
+    values.forEach((row, index) => {
+      if (index > 0 && row[0] != null && row[0] !== '') {
+        existingById.set(String(row[0]), { row, rowNumber: index + 1 });
+      }
+    });
+  } catch (e) {
+    sheet = null;
+  }
+  if (!sheet) {
+    return;
+  }
+  (Array.isArray(events) ? events : []).forEach((event) => {
+    try {
+      const existing = existingById.get(event.event_id);
+      if (existing) {
+        const refresh = [
+          [2, event.conversation_id],
+          [3, event.sender_id],
+          [4, event.sender_username],
+          [5, event.sender_name],
+          [6, event.text],
+          [7, event.created_at],
+          [8, event.is_mine],
+          [DM_COL_LAST_SEEN_AT, nowIso],
+        ];
+        refresh.forEach(([col, value]) => {
+          sheet.getRange(existing.rowNumber, col).setValue(value == null ? '' : value);
+        });
+      } else {
+        sheet.appendRow([
+          event.event_id,
+          event.conversation_id,
+          event.sender_id,
+          event.sender_username == null ? '' : event.sender_username,
+          event.sender_name == null ? '' : event.sender_name,
+          event.text,
+          event.created_at,
+          event.is_mine,
+          nowIso,
+          nowIso,
+        ]);
+      }
+    } catch (e) {
+      // one bad row must not lose the rest of the batch
+    }
+  });
+}
+
+/**
+ * Reads the whole "dm_state" tab into a Map keyed by
+ * conversation_id. Missing/unreadable state reads as empty, which
+ * only makes conversations look unread — never the reverse.
+ */
+export function readDmState() {
+  const byConversation = new Map();
+  try {
+    const sheet = getDmStateSheet();
+    const values = sheet.getDataRange().getValues();
+    values.forEach((row, index) => {
+      if (index > 0 && row[0] != null && row[0] !== '') {
+        byConversation.set(String(row[0]), {
+          last_read_event_id:
+            row[DM_STATE_COL_LAST_READ - 1] != null && row[DM_STATE_COL_LAST_READ - 1] !== ''
+              ? String(row[DM_STATE_COL_LAST_READ - 1])
+              : null,
+          last_replied_event_id:
+            row[DM_STATE_COL_LAST_REPLIED - 1] != null &&
+            row[DM_STATE_COL_LAST_REPLIED - 1] !== ''
+              ? String(row[DM_STATE_COL_LAST_REPLIED - 1])
+              : null,
+        });
+      }
+    });
+  } catch (e) {
+    // treated as no state at all
+  }
+  return byConversation;
+}
+
+/**
+ * Advances the dm_state markers of one conversation. A marker is
+ * only ever moved forward (numeric event-id comparison), never
+ * backwards, and a missing conversation row is created. Returns
+ * the resulting markers, or null when storage failed (bookkeeping
+ * failures are swallowed, like the inbox's).
+ */
+export function updateDmState(conversationId, updates) {
+  try {
+    const sheet = getDmStateSheet();
+    const values = sheet.getDataRange().getValues();
+    const nowIso = new Date().toISOString();
+    const convId = String(conversationId);
+    let rowNumber = -1;
+    let current = { last_read_event_id: null, last_replied_event_id: null };
+    for (let index = 1; index < values.length; index += 1) {
+      if (String(values[index][0]) === convId) {
+        rowNumber = index + 1;
+        current = {
+          last_read_event_id:
+            values[index][DM_STATE_COL_LAST_READ - 1] != null &&
+            values[index][DM_STATE_COL_LAST_READ - 1] !== ''
+              ? String(values[index][DM_STATE_COL_LAST_READ - 1])
+              : null,
+          last_replied_event_id:
+            values[index][DM_STATE_COL_LAST_REPLIED - 1] != null &&
+            values[index][DM_STATE_COL_LAST_REPLIED - 1] !== ''
+              ? String(values[index][DM_STATE_COL_LAST_REPLIED - 1])
+              : null,
+        };
+        break;
+      }
+    }
+    const advance = (cur, next) =>
+      next != null && next !== '' && (!cur || compareDmEventIds(next, cur) > 0)
+        ? String(next)
+        : cur;
+    const nextState = {
+      last_read_event_id:
+        updates && updates.last_read_event_id !== undefined
+          ? advance(current.last_read_event_id, updates.last_read_event_id)
+          : current.last_read_event_id,
+      last_replied_event_id:
+        updates && updates.last_replied_event_id !== undefined
+          ? advance(current.last_replied_event_id, updates.last_replied_event_id)
+          : current.last_replied_event_id,
+    };
+    if (rowNumber === -1) {
+      sheet.appendRow([
+        convId,
+        nextState.last_read_event_id || '',
+        nextState.last_replied_event_id || '',
+        nowIso,
+      ]);
+    } else {
+      sheet.getRange(rowNumber, DM_STATE_COL_LAST_READ).setValue(nextState.last_read_event_id || '');
+      sheet
+        .getRange(rowNumber, DM_STATE_COL_LAST_REPLIED)
+        .setValue(nextState.last_replied_event_id || '');
+      sheet.getRange(rowNumber, DM_STATE_COL_UPDATED_AT).setValue(nowIso);
+    }
+    return nextState;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Groups normalized DM events into the API's Conversation shape:
+ * conversations ordered by their latest event (newest first),
+ * messages chronological (oldest first) and capped at the newest
+ * DM_MESSAGES_PER_CONVERSATION. unread / needs_reply derive from
+ * the dm_state markers: both need the latest event to be someone
+ * else's and newer than the respective marker (or no marker).
+ */
+export function buildDmConversations(events, stateByConversation, usersById, ownId) {
+  const groups = new Map();
+  (Array.isArray(events) ? events : []).forEach((event) => {
+    if (!groups.has(event.conversation_id)) {
+      groups.set(event.conversation_id, []);
+    }
+    groups.get(event.conversation_id).push(event);
+  });
+  const conversations = [];
+  groups.forEach((list, conversationId) => {
+    const sorted = [...list].sort(compareDmMessages_);
+    const messages = sorted.slice(-DM_MESSAGES_PER_CONVERSATION).map(publicDmMessage_);
+    const latestEvent = messages[messages.length - 1];
+    // Participants: everyone the events name, minus the owner,
+    // in first-appearance order. When participant_ids are absent,
+    // fall back to the distinct other senders.
+    const seen = new Set();
+    const participants = [];
+    const addParticipant = (id, fallback) => {
+      const pid = String(id);
+      if (pid === String(ownId) || seen.has(pid)) {
+        return;
+      }
+      seen.add(pid);
+      const user = (usersById && usersById[pid]) || fallback || {};
+      participants.push({
+        id: pid,
+        name: user.name != null ? user.name : null,
+        username: user.username != null ? user.username : null,
+      });
+    };
+    sorted.forEach((event) => {
+      (event.participant_ids || []).forEach((pid) => addParticipant(pid, null));
+    });
+    if (participants.length === 0) {
+      sorted.forEach((event) => {
+        if (!event.is_mine && event.sender_id) {
+          addParticipant(event.sender_id, {
+            name: event.sender_name,
+            username: event.sender_username,
+          });
+        }
+      });
+    }
+    const state = (stateByConversation && stateByConversation.get(conversationId)) || {};
+    const unread =
+      !latestEvent.is_mine &&
+      (!state.last_read_event_id ||
+        compareDmEventIds(latestEvent.event_id, state.last_read_event_id) > 0);
+    const needsReply =
+      !latestEvent.is_mine &&
+      (!state.last_replied_event_id ||
+        compareDmEventIds(latestEvent.event_id, state.last_replied_event_id) > 0);
+    conversations.push({
+      conversation_id: conversationId,
+      participants,
+      latest_event: latestEvent,
+      messages,
+      unread,
+      needs_reply: needsReply,
+    });
+  });
+  conversations.sort((a, b) => compareDmMessages_(b.latest_event, a.latest_event));
+  return conversations;
+}
+
+/**
+ * Backs the "list_dms" action. Returns
+ * { ok: true, conversations: [...] }. A dm_events failure throws
+ * (the action then reports ok:false via doPost), like a mentions
+ * failure in list_comments. Under DRY_RUN the X API is never
+ * called and no sheet is touched.
+ */
+export function listDms() {
+  if (isDryRun_()) {
+    return { ok: true, dry_run: true, conversations: [] };
+  }
+  const credentials = getCredentials();
+  const me = signedGet('/users/me', {}, credentials);
+  const meData = me.json && me.json.data ? me.json.data : null;
+  if (me.code < 200 || me.code >= 300 || !meData || meData.id == null) {
+    throw new Error(`X API profile failed: ${summarizeXApiError(me.code, me.text)}`);
+  }
+  const ownId = String(meData.id);
+  const usersById = {
+    [ownId]: {
+      username: meData.username != null ? String(meData.username) : null,
+      name: meData.name != null ? String(meData.name) : null,
+    },
+  };
+  const byId = new Map();
+  let paginationToken = null;
+  for (let page = 0; page < DM_EVENTS_MAX_PAGES; page += 1) {
+    const query = {
+      event_types: 'MessageCreate',
+      max_results: String(DM_EVENTS_MAX_RESULTS),
+      expansions: 'sender_id,participant_ids',
+      'dm_event.fields':
+        'id,text,event_type,dm_conversation_id,created_at,sender_id,participant_ids',
+      'user.fields': 'name,username',
+    };
+    if (paginationToken) {
+      query.pagination_token = paginationToken;
+    }
+    const res = signedGet('/dm_events', query, credentials);
+    if (res.code < 200 || res.code >= 300 || !res.json) {
+      throw new Error(`X API dm_events failed: ${summarizeXApiError(res.code, res.text)}`);
+    }
+    Object.assign(usersById, dmUsersById_(res.json));
+    const items = Array.isArray(res.json.data) ? res.json.data : [];
+    items.forEach((raw) => {
+      const event = normalizeDmEvent(raw, usersById, ownId);
+      if (event && !byId.has(event.event_id)) {
+        byId.set(event.event_id, event);
+      }
+    });
+    paginationToken =
+      res.json.meta && res.json.meta.next_token ? String(res.json.meta.next_token) : null;
+    if (!paginationToken) {
+      break;
+    }
+  }
+  const events = [...byId.values()];
+  upsertDmEvents(events);
+  const conversations = buildDmConversations(events, readDmState(), usersById, ownId);
+  return { ok: true, conversations };
+}
+
+/**
+ * Backs the "mark_dm_read" action: advances the conversation's
+ * last_read_event_id (never backwards) and stamps updated_at.
+ * Under DRY_RUN nothing is written.
+ */
+export function markDmRead(conversationId, eventId) {
+  if (!conversationId || String(conversationId).trim() === '') {
+    throw new Error('conversation_id is empty');
+  }
+  if (!eventId || String(eventId).trim() === '') {
+    throw new Error('event_id is empty');
+  }
+  const result = {
+    ok: true,
+    conversation_id: String(conversationId),
+    event_id: String(eventId),
+  };
+  if (isDryRun_()) {
+    result.dry_run = true;
+    return result;
+  }
+  updateDmState(result.conversation_id, { last_read_event_id: result.event_id });
+  return result;
+}
+
+/**
+ * DM text validation: a non-empty string of at most
+ * DM_REPLY_MAX_CODE_POINTS Unicode code points. Deliberately NOT
+ * the weighted 280 rule — that limit belongs to tweets, and
+ * spreading code points (not UTF-16 units) is what counts an
+ * emoji as one character here. Throws on invalid text.
+ */
+export function validateDmText(text) {
+  if (!text || typeof text !== 'string' || text.trim() === '') {
+    throw new Error('text is empty');
+  }
+  const count = [...text].length;
+  if (count > DM_REPLY_MAX_CODE_POINTS) {
+    throw new Error(
+      `text is too long: ${count} code points exceeds ${DM_REPLY_MAX_CODE_POINTS}`
+    );
+  }
+  return text;
+}
+
+/**
+ * Sends one DM into a conversation via
+ * POST /2/dm_conversations/:id/messages. The JSON body is not
+ * part of the OAuth signature, exactly like postTweet. Returns
+ * { event_id } with the X response's dm_event_id (null when the
+ * API did not return one). Under DRY_RUN nothing is sent.
+ */
+export function postDmMessage(conversationId, text) {
+  validateDmText(text);
+  if (!conversationId || String(conversationId).trim() === '') {
+    throw new Error('conversation_id is empty');
+  }
+  if (isDryRun_()) {
+    return { event_id: null, dry_run: true };
+  }
+  const credentials = getCredentials();
+  const url = `${API_BASE}/dm_conversations/${encodeURIComponent(String(conversationId))}/messages`;
+  const authorization = buildAuthorizationHeader(
+    { method: 'POST', baseUrl: url },
+    credentials
+  );
+  const { code, json, text: body } = fetchJson(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: authorization },
+    payload: JSON.stringify({ text }),
+  });
+  if (code < 200 || code >= 300) {
+    throw new Error(`X API DM post failed (${code}): ${body}`);
+  }
+  return {
+    event_id: json && json.data && json.data.dm_event_id != null
+      ? String(json.data.dm_event_id)
+      : null,
+  };
+}
+
+/**
+ * Backs the "reply_dm" action: sends the DM, then advances both
+ * dm_state markers to the sent event and stores the sent event in
+ * the "dm" tab as one of our own messages (both only when the API
+ * returned a dm_event_id). The bookkeeping never fails a reply
+ * that was already sent. Under DRY_RUN nothing is sent and no
+ * sheet changes.
+ */
+export function replyDm(conversationId, text) {
+  const posted = postDmMessage(conversationId, text);
+  const convId = String(conversationId);
+  if (posted.dry_run) {
+    return { ok: true, conversation_id: convId, event_id: null, dry_run: true };
+  }
+  if (posted.event_id) {
+    updateDmState(convId, {
+      last_read_event_id: posted.event_id,
+      last_replied_event_id: posted.event_id,
+    });
+    try {
+      const credentials = getCredentials();
+      const me = signedGet('/users/me', {}, credentials);
+      const meData = me.json && me.json.data ? me.json.data : null;
+      if (meData && meData.id != null) {
+        upsertDmEvents([
+          {
+            event_id: posted.event_id,
+            conversation_id: convId,
+            sender_id: String(meData.id),
+            sender_username: meData.username != null ? String(meData.username) : null,
+            sender_name: meData.name != null ? String(meData.name) : null,
+            text: String(text),
+            created_at: new Date().toISOString(),
+            is_mine: true,
+            participant_ids: [],
+          },
+        ]);
+      }
+    } catch (e) {
+      // the reply is sent; only the local copy is missing
+    }
+  }
+  return { ok: true, conversation_id: convId, event_id: posted.event_id };
+}
+
 /**
  * Verifies a Google ID token. Returns the token payload when the token is
  * valid, email-verified, and the email is ALLOWED_EMAIL; otherwise null.
@@ -1016,6 +1621,12 @@ export function doGet() {
  *   the owner's posts, collected into the "inbox" sheet.
  * - { idToken|share_token, action: "reply_comment", comment_id,
  *   text } -> posts a reply to that comment and marks it replied.
+ * - { idToken|share_token, action: "list_dms" } -> DM events
+ *   collected into the "dm" sheet, grouped into conversations.
+ * - { idToken|share_token, action: "mark_dm_read", conversation_id,
+ *   event_id } -> advances the conversation's read marker.
+ * - { idToken|share_token, action: "reply_dm", conversation_id,
+ *   text } -> sends a DM into that conversation.
  * Returns { ok, id, url, postedText, verifiedText } (post) or
  * { ok: false, error }.
  */
@@ -1087,11 +1698,51 @@ export function doPost(e) {
         _share: { expires_at: shareSession.expires_at },
       });
     }
-    if (body.action === 'list_comments' || body.action === 'reply_comment') {
-      // Comment inbox: reached only through the user auth path
-      // above (Google ID token or share session) — the sync token
-      // was already rejected for anything but sns_snapshot.
+    if (
+      body.action === 'list_comments' ||
+      body.action === 'reply_comment' ||
+      body.action === 'list_dms' ||
+      body.action === 'mark_dm_read' ||
+      body.action === 'reply_dm'
+    ) {
+      // Comment and DM inboxes: reached only through the user auth
+      // path above (Google ID token or share session) — the sync
+      // token was already rejected for anything but sns_snapshot.
       const actor = identity ? identity.email : '(share link)';
+      if (body.action === 'list_dms') {
+        const inbox = listDms();
+        const result = { ...inbox };
+        if (shareSession) {
+          result._share = { expires_at: shareSession.expires_at };
+        }
+        logToSheet('list_dms', {
+          email: actor,
+          ok: true,
+          count: inbox.conversations.length,
+          dry_run: !!inbox.dry_run,
+        });
+        return jsonOutput(result);
+      }
+      if (body.action === 'mark_dm_read') {
+        const marked = markDmRead(body.conversation_id, body.event_id);
+        const result = { ...marked };
+        if (shareSession) {
+          result._share = { expires_at: shareSession.expires_at };
+        }
+        logToSheet('mark_dm_read', { email: actor, ...marked });
+        return jsonOutput(result);
+      }
+      if (body.action === 'reply_dm') {
+        const replied = replyDm(body.conversation_id, body.text);
+        const result = { ...replied };
+        if (shareSession) {
+          result._share = { expires_at: shareSession.expires_at };
+        }
+        // Metadata only: the reply text itself is not copied into
+        // the action log (the sent event lives in the "dm" tab).
+        logToSheet('reply_dm', { email: actor, ...replied });
+        return jsonOutput(result);
+      }
       if (body.action === 'list_comments') {
         const inbox = listComments();
         const result = { ...inbox };
