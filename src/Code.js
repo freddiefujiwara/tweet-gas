@@ -577,7 +577,7 @@ export function buildSnsSnapshot() {
 // scoped to sns_snapshot only):
 // - "list_comments": collect comments on the owner's posts from the
 //   mentions timeline, a per-conversation recent search, and the
-//   quote tweets of the owner's recent quoted posts, store them in
+//   quote tweets of the owner's quoted posts, store them in
 //   the "inbox" sheet, and return them newest first. Every comment
 //   carries a "kind" (mention / reply / quote; quote wins whenever a
 //   tweet quotes one of the owner's posts).
@@ -630,14 +630,14 @@ export const INBOX_MENTIONS_MAX_RESULTS = 100;
 export const INBOX_SEARCH_WINDOW_DAYS = 7;
 export const INBOX_SEARCH_POSTS_LIMIT = 10;
 export const INBOX_SEARCH_MAX_RESULTS = 100;
-// Third source: quote tweets. Only the owner's newest posts of the
-// last 30 days (at most INBOX_QUOTE_POSTS_LIMIT of them) are even
-// considered, only those whose public_metrics report quote_count
-// > 0 are queried, and the quote_tweets calls themselves are
-// capped at INBOX_QUOTE_CALLS_LIMIT per list_comments run, so the
-// quote source stays bounded like the conversation search.
-export const INBOX_QUOTE_WINDOW_DAYS = 30;
-export const INBOX_QUOTE_POSTS_LIMIT = 15;
+// Third source: quote tweets. The owner's posts come from the one
+// shared fetch (at most 100 of them, newest first); among them,
+// only those whose public_metrics report quote_count > 0 are
+// queried, and the quote_tweets calls themselves are capped at
+// INBOX_QUOTE_CALLS_LIMIT per list_comments run, so the quote
+// source stays bounded like the conversation search. There is no
+// age window: a quoted post keeps surfacing its quotes no matter
+// how old it is (quotes are rare, so the call cap is enough).
 export const INBOX_QUOTE_CALLS_LIMIT = 10;
 export const INBOX_QUOTE_MAX_RESULTS = 100;
 
@@ -815,15 +815,13 @@ export function selectConversationSearchTargets(posts, nowMs) {
 
 /**
  * Chooses the owner's posts whose quote tweets get fetched:
- * newest first, only those created within the last
- * INBOX_QUOTE_WINDOW_DAYS days, at most INBOX_QUOTE_POSTS_LIMIT
- * posts are considered, only posts whose public_metrics report
- * quote_count > 0 are kept, and the result is capped at
- * INBOX_QUOTE_CALLS_LIMIT so a list_comments run never makes
- * more quote_tweets calls than that.
+ * among the fetched posts (the one shared fetch, at most 100),
+ * newest first, only posts whose public_metrics report
+ * quote_count > 0 are kept — however old they are — and the
+ * result is capped at INBOX_QUOTE_CALLS_LIMIT so a list_comments
+ * run never makes more quote_tweets calls than that.
  */
-export function selectQuoteTargets(posts, nowMs) {
-  const cutoff = nowMs - INBOX_QUOTE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+export function selectQuoteTargets(posts) {
   return (Array.isArray(posts) ? posts : [])
     .filter((post) => post && post.id != null && post.created_at)
     .map((post) => ({
@@ -831,9 +829,8 @@ export function selectQuoteTargets(posts, nowMs) {
       createdMs: Date.parse(post.created_at),
       quoteCount: xMetricOrNull(post.public_metrics ? post.public_metrics.quote_count : null),
     }))
-    .filter((post) => Number.isFinite(post.createdMs) && post.createdMs >= cutoff)
+    .filter((post) => Number.isFinite(post.createdMs))
     .sort((a, b) => b.createdMs - a.createdMs)
-    .slice(0, INBOX_QUOTE_POSTS_LIMIT)
     .filter((post) => post.quoteCount != null && post.quoteCount > 0)
     .slice(0, INBOX_QUOTE_CALLS_LIMIT)
     .map((post) => post.id);
@@ -1019,7 +1016,7 @@ export function listComments() {
   // not @-mention the owner). Any failure here — the endpoint is
   // plan-gated, so 401/403 is expected on tiers without search —
   // degrades to the mentions result instead of failing the action.
-  // Third source: quote tweets of the owner's recent quoted posts.
+  // Third source: quote tweets of the owner's quoted posts.
   // It degrades the same way, independently of the search source.
   const notes = [];
   if (!ownItems) {
@@ -1049,7 +1046,7 @@ export function listComments() {
       notes.push('conversation reply search failed for some posts; results may be incomplete');
     }
 
-    const quoteTargets = selectQuoteTargets(ownItems, Date.now());
+    const quoteTargets = selectQuoteTargets(ownItems);
     let quoteFailed = false;
     quoteTargets.forEach((postId) => {
       const found = signedGet(
