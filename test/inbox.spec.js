@@ -626,18 +626,19 @@ describe('kind determination', () => {
 });
 
 describe('selectQuoteTargets', () => {
-  it('keeps only quoted posts inside the 30-day window, newest first', () => {
+  it('keeps quoted posts of any age, newest first, and skips quote_count 0', () => {
     const posts = [
       { id: 'a', created_at: daysAgo(10), public_metrics: { quote_count: 0 } },
       { id: 'b', created_at: daysAgo(20), public_metrics: { quote_count: 2 } },
       { id: 'c', created_at: daysAgo(5), public_metrics: { quote_count: 1 } },
       { id: 'd', created_at: daysAgo(40), public_metrics: { quote_count: 9 } },
       { id: 'e', created_at: daysAgo(3) },
+      { id: 'f', created_at: daysAgo(200), public_metrics: { quote_count: 3 } },
     ];
-    expect(Code.selectQuoteTargets(posts, Date.now())).toEqual(['c', 'b']);
+    expect(Code.selectQuoteTargets(posts)).toEqual(['c', 'b', 'd', 'f']);
   });
 
-  it('considers at most 15 posts and caps the calls at 10', () => {
+  it('caps the calls at 10, newest quoted posts first', () => {
     const posts = [];
     for (let i = 0; i < 20; i += 1) {
       posts.push({
@@ -646,9 +647,26 @@ describe('selectQuoteTargets', () => {
         public_metrics: { quote_count: 1 },
       });
     }
-    const targets = Code.selectQuoteTargets(posts, Date.now());
+    const targets = Code.selectQuoteTargets(posts);
     expect(targets).toHaveLength(Code.INBOX_QUOTE_CALLS_LIMIT);
     expect(targets[0]).toBe('2000');
+  });
+
+  it('considers quoted posts beyond the newest 15 posts', () => {
+    const posts = [];
+    for (let i = 0; i < 17; i += 1) {
+      posts.push({
+        id: String(3000 + i),
+        created_at: daysAgo(i + 1),
+        public_metrics: { quote_count: 0 },
+      });
+    }
+    posts.push({
+      id: '3999',
+      created_at: daysAgo(60),
+      public_metrics: { quote_count: 5 },
+    });
+    expect(Code.selectQuoteTargets(posts)).toEqual(['3999']);
   });
 });
 
@@ -699,14 +717,15 @@ describe('list_comments quote source', () => {
     expect(quoteCalls()).toHaveLength(0);
   });
 
-  it('caps quote_tweets calls at 10 even when many posts are quoted', () => {
+  it('caps quote_tweets calls at 10 even when many old posts are quoted', () => {
     const posts = [];
     for (let i = 0; i < 15; i += 1) {
       posts.push({
-        // 8..22 days old: inside the 30-day quote window but
-        // outside the 7-day conversation search window.
+        // 35..49 days old: outside the old 30-day quote window
+        // and outside the 7-day conversation search window, yet
+        // still quote targets now that the age window is gone.
         id: String(5000 + i),
-        created_at: daysAgo(8 + i),
+        created_at: daysAgo(35 + i),
         public_metrics: { quote_count: 1 },
       });
     }
