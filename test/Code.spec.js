@@ -53,21 +53,38 @@ const mockShareSheet = {
   }),
 };
 
+let ownerValues = [];
+let ownerSheetExists = true;
+const mockOwnerSheet = {
+  appendRow: (row) => ownerValues.push([...row]),
+  getDataRange: () => ({ getValues: () => ownerValues }),
+  getRange: (row, col) => ({
+    setValue: (value) => {
+      ownerValues[row - 1][col - 1] = value;
+    },
+  }),
+};
+
 function installSpreadsheetApp() {
   global.SpreadsheetApp = {
     getActiveSpreadsheet: () => ({
-      getSheetByName: (name) =>
-        name === 'share_sessions'
-          ? shareSheetExists
-            ? mockShareSheet
-            : null
-          : sheetExists
-            ? mockSheet
-            : null,
+      getSheetByName: (name) => {
+        if (name === 'share_sessions') {
+          return shareSheetExists ? mockShareSheet : null;
+        }
+        if (name === 'owner_sessions') {
+          return ownerSheetExists ? mockOwnerSheet : null;
+        }
+        return sheetExists ? mockSheet : null;
+      },
       insertSheet: (name) => {
         if (name === 'share_sessions') {
           shareSheetExists = true;
           return mockShareSheet;
+        }
+        if (name === 'owner_sessions') {
+          ownerSheetExists = true;
+          return mockOwnerSheet;
         }
         sheetExists = true;
         return mockSheet;
@@ -107,6 +124,8 @@ beforeEach(() => {
   sheetExists = true;
   shareValues = [[...SHARE_HEADERS]];
   shareSheetExists = true;
+  ownerValues = [[...SHARE_HEADERS]];
+  ownerSheetExists = true;
   uuidCounter = 0;
   installSpreadsheetApp();
   mockGetProperty.mockImplementation((name) => KEYS[name] ?? null);
@@ -456,6 +475,97 @@ describe('doPost share sessions', () => {
       ok: false,
       error: 'unauthorized',
     });
+  });
+});
+
+describe('doPost owner sessions', () => {
+  const event = (obj) => ({ postData: { contents: JSON.stringify(obj) } });
+  const post = (obj) => JSON.parse(Code.doPost(event(obj)).text);
+  const hashOf = (token) =>
+    crypto.createHash('sha256').update(String(token), 'utf8').digest('hex');
+
+  function mockAllFetches() {
+    mockFetch.mockImplementation((url, options) => {
+      if (String(url).includes('tokeninfo')) {
+        return fetchResponse(200, { email: 'zegenvs@gmail.com', email_verified: 'true' });
+      }
+      if (options && options.method === 'post') {
+        return fetchResponse(201, { data: { id: '555', text: 'hi' } });
+      }
+      return fetchResponse(200, { data: { id: '555', text: 'hi' } });
+    });
+  }
+
+  const exchange = () => {
+    mockAllFetches();
+    const result = post({ idToken: 'good', action: 'exchange_session' });
+    expect(result.ok).toBe(true);
+    return result.session_token;
+  };
+
+  it('requires an ID token to exchange for an owner session', () => {
+    mockFetch.mockReturnValue(fetchResponse(400, {}));
+    expect(post({ idToken: 'bad', action: 'exchange_session' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+  });
+
+  it('issues a 30-day owner session and stores only its hash', () => {
+    const token = exchange();
+    const result = post({ idToken: 'good', action: 'exchange_session' });
+    expect(result.ttl_seconds).toBe(30 * 24 * 60 * 60);
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+    expect(ownerValues).toHaveLength(3);
+    expect(ownerValues[2][0]).toBe(hashOf(result.session_token));
+    expect(ownerValues[2][0]).not.toBe(result.session_token);
+  });
+
+  it('posts with a valid owner session token', () => {
+    const token = exchange();
+    mockAllFetches();
+    const result = post({ session_token: token, text: 'hi' });
+    expect(result.ok).toBe(true);
+    expect(result.id).toBe('555');
+    expect(ownerValues[1][4]).toBe(1);
+  });
+
+  it('rejects an unknown owner session token', () => {
+    expect(post({ session_token: 'no-such-token', text: 'hi' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+  });
+
+  it('revokes the previous owner session when a new one is exchanged', () => {
+    const first = exchange();
+    const second = exchange();
+    expect(first).not.toBe(second);
+    expect(post({ session_token: first, text: 'hi' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+    mockAllFetches();
+    expect(post({ session_token: second, text: 'hi' }).ok).toBe(true);
+  });
+
+  it('revokes the owner session via the revoke_session action', () => {
+    const token = exchange();
+    expect(post({ session_token: token, action: 'revoke_session' })).toEqual({
+      ok: true,
+      revoked: true,
+    });
+    expect(post({ session_token: token, text: 'hi' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
+  });
+
+  it('accepts an owner session as proof for issuing a share link', () => {
+    const token = exchange();
+    const result = post({ session_token: token, action: 'issue_share' });
+    expect(result.ok).toBe(true);
+    expect(result.share_token).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 
