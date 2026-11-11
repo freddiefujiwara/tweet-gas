@@ -66,14 +66,18 @@ function isDryRun_() {
   return value === '1' || value === 'true';
 }
 
-function getShareSheet() {
+function getSessionSheet(sheetName) {
   const ss = spreadsheet_();
-  let sheet = ss.getSheetByName(SHARE_SHEET_NAME);
+  let sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
-    sheet = ss.insertSheet(SHARE_SHEET_NAME);
+    sheet = ss.insertSheet(sheetName);
     sheet.appendRow(SHARE_HEADERS);
   }
   return sheet;
+}
+
+function getShareSheet() {
+  return getSessionSheet(SHARE_SHEET_NAME);
 }
 
 function hashShareToken(token) {
@@ -83,10 +87,14 @@ function hashShareToken(token) {
     .join('');
 }
 
-function readShareRows() {
-  const sheet = getShareSheet();
+function readSessionRows(sheetName) {
+  const sheet = getSessionSheet(sheetName);
   const values = sheet.getDataRange().getValues();
   return { sheet, values };
+}
+
+function readShareRows() {
+  return readSessionRows(SHARE_SHEET_NAME);
 }
 
 function shareCellIso(value) {
@@ -99,8 +107,8 @@ function shareCellIso(value) {
   return String(value);
 }
 
-function revokeActiveShareSessions(nowIso) {
-  const { sheet, values } = readShareRows();
+function revokeActiveSessions(sheetName, nowIso) {
+  const { sheet, values } = readSessionRows(sheetName);
   values.forEach((row, index) => {
     if (index === 0) {
       return;
@@ -113,19 +121,27 @@ function revokeActiveShareSessions(nowIso) {
   });
 }
 
-function issueShareSession() {
+function revokeActiveShareSessions(nowIso) {
+  revokeActiveSessions(SHARE_SHEET_NAME, nowIso);
+}
+
+function issueSession(sheetName, tokenKey) {
   const now = new Date();
   const nowIso = now.toISOString();
   const expiresIso = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000).toISOString();
-  revokeActiveShareSessions(nowIso);
+  revokeActiveSessions(sheetName, nowIso);
   const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
-  getShareSheet().appendRow([hashShareToken(token), nowIso, expiresIso, '', 0, '']);
+  getSessionSheet(sheetName).appendRow([hashShareToken(token), nowIso, expiresIso, '', 0, '']);
   return {
-    share_token: token,
+    [tokenKey]: token,
     issued_at: nowIso,
     expires_at: expiresIso,
     ttl_seconds: SHARE_TTL_SECONDS,
   };
+}
+
+function issueShareSession() {
+  return issueSession(SHARE_SHEET_NAME, 'share_token');
 }
 
 function revokeShareSession() {
@@ -133,12 +149,12 @@ function revokeShareSession() {
   return { revoked: true };
 }
 
-function validateShareToken(token) {
+function validateSessionToken(sheetName, token) {
   if (!token) {
     return null;
   }
   const hash = hashShareToken(token);
-  const { sheet, values } = readShareRows();
+  const { sheet, values } = readSessionRows(sheetName);
   const nowIso = new Date().toISOString();
   for (let index = 1; index < values.length; index += 1) {
     const row = values[index];
@@ -157,6 +173,42 @@ function validateShareToken(token) {
     return { expires_at: expiresAt };
   }
   return null;
+}
+
+function validateShareToken(token) {
+  return validateSessionToken(SHARE_SHEET_NAME, token);
+}
+
+// --- Owner sessions (long-lived sign-in) ---
+// Google ID tokens expire after about an hour, which used to drop the
+// owner back at the sign-in gate. After a Google sign-in the frontend
+// exchanges the ID token for one of these 30-day owner sessions (same
+// storage scheme as share sessions, separate sheet) and uses it for
+// all later calls. Issuing a new one revokes the previous ones, and
+// the frontend revokes its session on logout.
+
+export const OWNER_SHEET_NAME = 'owner_sessions';
+
+function issueOwnerSession() {
+  return issueSession(OWNER_SHEET_NAME, 'session_token');
+}
+
+function validateOwnerToken(token) {
+  return validateSessionToken(OWNER_SHEET_NAME, token);
+}
+
+function revokeOwnerSession(token) {
+  if (token) {
+    const hash = hashShareToken(token);
+    const { sheet, values } = readSessionRows(OWNER_SHEET_NAME);
+    const nowIso = new Date().toISOString();
+    values.forEach((row, index) => {
+      if (index > 0 && row[0] === hash && !shareCellIso(row[3])) {
+        sheet.getRange(index + 1, 4).setValue(nowIso);
+      }
+    });
+  }
+  return { revoked: true };
 }
 
 /**
@@ -1818,8 +1870,12 @@ export function doGet() {
  * POST JSON API. Bodies:
  * - { idToken, text }                       -> posts and verifies.
  * - { share_token, text }                   -> same, via a share link.
- * - { idToken, action: "issue_share" }      -> issues a share link.
- * - { idToken, action: "revoke_share" }     -> revokes active links.
+ * - { session_token, ... }                  -> same, via the 30-day
+ *   owner session exchanged at sign-in (see "Owner sessions").
+ * - { idToken, action: "exchange_session" } -> issues an owner session.
+ * - { session_token, action: "revoke_session" } -> revokes it (logout).
+ * - { idToken|session_token, action: "issue_share" } -> issues a share link.
+ * - { idToken|session_token, action: "revoke_share" } -> revokes links.
  * - { share_token, action: "validate_share" } -> checks a link and
  *   returns its expiry as { ok, _share: { expires_at } }.
  * - { sync_token, action: "sns_snapshot" }  -> the X numbers for
@@ -1868,20 +1924,42 @@ export function doPost(e) {
       });
       return jsonOutput({ ...snapshot, _sync: true });
     }
-    if (body.action === 'issue_share' || body.action === 'revoke_share') {
+    if (body.action === 'exchange_session') {
       const identity = verifyIdToken(body.idToken);
       if (!identity) {
         logToSheet('doPost', { ok: false, error: 'unauthorized' });
         return jsonOutput({ ok: false, error: 'unauthorized' });
       }
+      const result = issueOwnerSession();
+      logToSheet('exchange_session', { ok: true, email: identity.email });
+      return jsonOutput({ ok: true, ...result });
+    }
+    if (body.action === 'revoke_session') {
+      revokeOwnerSession(body.session_token);
+      return jsonOutput({ ok: true, revoked: true });
+    }
+    if (body.action === 'issue_share' || body.action === 'revoke_share') {
+      const identity = verifyIdToken(body.idToken);
+      const sessionAuth = !identity && Boolean(validateOwnerToken(body.session_token));
+      if (!identity && !sessionAuth) {
+        logToSheet('doPost', { ok: false, error: 'unauthorized' });
+        return jsonOutput({ ok: false, error: 'unauthorized' });
+      }
       const result =
         body.action === 'issue_share' ? issueShareSession() : revokeShareSession();
-      logToSheet(body.action, { ok: true, email: identity.email });
+      logToSheet(body.action, { ok: true, email: identity ? identity.email : 'owner-session' });
       return jsonOutput({ ok: true, ...result });
     }
     let identity = null;
     let shareSession = null;
-    if (body.share_token) {
+    let ownerSession = null;
+    if (body.session_token) {
+      ownerSession = validateOwnerToken(body.session_token);
+      if (!ownerSession) {
+        logToSheet('doPost', { ok: false, error: 'unauthorized' });
+        return jsonOutput({ ok: false, error: 'unauthorized' });
+      }
+    } else if (body.share_token) {
       shareSession = validateShareToken(body.share_token);
       if (!shareSession) {
         logToSheet('doPost', { ok: false, error: 'unauthorized' });
@@ -1916,7 +1994,7 @@ export function doPost(e) {
       // Comment and DM inboxes: reached only through the user auth
       // path above (Google ID token or share session) — the sync
       // token was already rejected for anything but sns_snapshot.
-      const actor = identity ? identity.email : '(share link)';
+      const actor = identity ? identity.email : ownerSession ? '(owner session)' : '(share link)';
       if (body.action === 'list_dms') {
         const inbox = listDms();
         const result = { ...inbox };
@@ -1992,7 +2070,7 @@ export function doPost(e) {
       result._share = { expires_at: shareSession.expires_at };
     }
     logToSheet('doPost', {
-      email: identity ? identity.email : '(share link)',
+      email: identity ? identity.email : ownerSession ? '(owner session)' : '(share link)',
       ...result,
     });
     return jsonOutput(result);
