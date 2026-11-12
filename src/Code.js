@@ -76,10 +76,6 @@ function getSessionSheet(sheetName) {
   return sheet;
 }
 
-function getShareSheet() {
-  return getSessionSheet(SHARE_SHEET_NAME);
-}
-
 function hashShareToken(token) {
   return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(token))
     .map((byte) => ((byte % 256) + 256) % 256)
@@ -91,10 +87,6 @@ function readSessionRows(sheetName) {
   const sheet = getSessionSheet(sheetName);
   const values = sheet.getDataRange().getValues();
   return { sheet, values };
-}
-
-function readShareRows() {
-  return readSessionRows(SHARE_SHEET_NAME);
 }
 
 function shareCellIso(value) {
