@@ -117,11 +117,13 @@ function revokeActiveShareSessions(nowIso) {
   revokeActiveSessions(SHARE_SHEET_NAME, nowIso);
 }
 
-function issueSession(sheetName, tokenKey) {
+function issueSession(sheetName, tokenKey, { revokePrevious = true } = {}) {
   const now = new Date();
   const nowIso = now.toISOString();
   const expiresIso = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000).toISOString();
-  revokeActiveSessions(sheetName, nowIso);
+  if (revokePrevious) {
+    revokeActiveSessions(sheetName, nowIso);
+  }
   const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
   getSessionSheet(sheetName).appendRow([hashShareToken(token), nowIso, expiresIso, '', 0, '']);
   return {
@@ -175,14 +177,16 @@ function validateShareToken(token) {
 // Google ID tokens expire after about an hour, which used to drop the
 // owner back at the sign-in gate. After a Google sign-in the frontend
 // exchanges the ID token for one of these 30-day owner sessions (same
-// storage scheme as share sessions, separate sheet) and uses it for
-// all later calls. Issuing a new one revokes the previous ones, and
-// the frontend revokes its session on logout.
+// storage scheme as share sessions, separate sheet) and uses it for all
+// later calls. Owner sessions coexist across devices: issuing a new one
+// does NOT revoke the others (unlike share links, where reissuing must
+// invalidate the old link). The frontend revokes its own session on
+// logout.
 
 export const OWNER_SHEET_NAME = 'owner_sessions';
 
 function issueOwnerSession() {
-  return issueSession(OWNER_SHEET_NAME, 'session_token');
+  return issueSession(OWNER_SHEET_NAME, 'session_token', { revokePrevious: false });
 }
 
 function validateOwnerToken(token) {

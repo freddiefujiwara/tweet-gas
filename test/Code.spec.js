@@ -537,14 +537,14 @@ describe('doPost owner sessions', () => {
     });
   });
 
-  it('revokes the previous owner session when a new one is exchanged', () => {
+  it('keeps the previous owner session valid when a new one is exchanged', () => {
     const first = exchange();
     const second = exchange();
     expect(first).not.toBe(second);
-    expect(post({ session_token: first, text: 'hi' })).toEqual({
-      ok: false,
-      error: 'unauthorized',
-    });
+    expect(ownerValues[1][3]).toBe('');
+    expect(ownerValues[2][3]).toBe('');
+    mockAllFetches();
+    expect(post({ session_token: first, text: 'hi' }).ok).toBe(true);
     mockAllFetches();
     expect(post({ session_token: second, text: 'hi' }).ok).toBe(true);
   });
