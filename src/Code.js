@@ -16,7 +16,8 @@
  *   marker, and "reply_dm" answers a conversation. Same user
  *   auth path as the comment inbox.
  * - One machine-to-machine exception: social-gas reads the X numbers
- *   (followers + recent post metrics) through the "sns_snapshot"
+ *   (followers + recent post metrics, plus the pay-per-use credit
+ *   balance and daily post consumption) through the "sns_snapshot"
  *   action, authorized by the SYNC_TOKEN script property — the same
  *   sync-token pattern alarm-gas uses for the time-table sync. The
  *   X keys stay in this project; social-gas never holds them.
@@ -335,18 +336,23 @@ function fetchJson(url, options) {
   }
   // Log everything the API returned. The query string is stripped because
   // the tokeninfo URL carries the ID token itself (claims in the response
-  // body are fine to log; the credential is not). DM endpoints are the one
-  // exception: a DM response body must never be stored anywhere (the same
-  // rule probeDmAccess follows), so only the status is logged for them.
+  // body are fine to log; the credential is not). Two exceptions where
+  // only the status is logged: DM endpoints, whose response body must
+  // never be stored anywhere (the same rule probeDmAccess follows), and
+  // the OAuth2 token endpoint, whose response body IS a credential
+  // (the app-only bearer token the usage endpoints are read with).
   const bareUrl = url.split('?')[0];
   const isDmEndpoint = /\/(dm_events|dm_conversations)(\/|$)/.test(bareUrl);
+  const isTokenEndpoint = bareUrl.endsWith('/oauth2/token');
   logToSheet('fetch', {
     method: (options.method || 'get').toUpperCase(),
     url: bareUrl,
     status: code,
     response: isDmEndpoint
       ? '(not logged: DM endpoint)'
-      : text.length > LOG_DETAIL_MAX ? text.slice(0, LOG_DETAIL_MAX) + '…(truncated)' : text,
+      : isTokenEndpoint
+        ? '(not logged: credential endpoint)'
+        : text.length > LOG_DETAIL_MAX ? text.slice(0, LOG_DETAIL_MAX) + '…(truncated)' : text,
   });
   return { code, json, text };
 }
@@ -579,6 +585,8 @@ export function buildSnsSnapshot() {
     x: { followers: null, username: null, recent_posts: null },
     x_error: null,
     posts_error: null,
+    x_usage: null,
+    usage_error: null,
   };
   if (isDryRun_()) {
     snapshot.dry_run = true;
@@ -590,8 +598,14 @@ export function buildSnsSnapshot() {
   } catch (err) {
     snapshot.x_error = String(err && err.message ? err.message : err);
     snapshot.posts_error = snapshot.x_error;
+    snapshot.usage_error = snapshot.x_error;
     return snapshot;
   }
+  // Usage (credit balance + daily post consumption) fails
+  // independently of the profile/posts halves, like they do.
+  const usageResult = buildXUsage(credentials);
+  snapshot.x_usage = usageResult.usage;
+  snapshot.usage_error = usageResult.error;
   const me = signedGet('/users/me', { 'user.fields': 'public_metrics' }, credentials);
   const user = me.json && me.json.data ? me.json.data : null;
   if (me.code < 200 || me.code >= 300 || !user || user.id == null) {
@@ -619,6 +633,191 @@ export function buildSnsSnapshot() {
   }
   snapshot.x.recent_posts = items.map(buildSnsSnapshotPost);
   return snapshot;
+}
+
+// --- X API usage (pay-per-use credits) ----------------------------------
+// The usage endpoints are app-level: unlike everything else here they
+// take an OAuth 2.0 app-only bearer token, not the OAuth 1.0a user
+// context. The token is minted from the consumer key/secret pair this
+// project already holds (POST /oauth2/token, client_credentials) and
+// fetched fresh for each snapshot: the token call is free, the
+// snapshot runs hourly, and minting per run means no credential is
+// ever cached or stored. The token response is never logged (see
+// fetchJson) and the token string never leaves buildXUsage.
+
+export const USAGE_TOKENS_URL = 'https://api.twitter.com/oauth2/token';
+// How many days of daily post consumption the snapshot carries
+// (the endpoint serves at most 90).
+export const USAGE_TWEETS_DAYS = 90;
+
+/**
+ * Mints an app-only bearer token from the consumer key/secret.
+ * Returns the token string, or null when the token call failed.
+ */
+function fetchXBearerToken_(credentials) {
+  const basic = Utilities.base64Encode(
+    `${percentEncode(credentials.consumerKey)}:${percentEncode(credentials.consumerSecret)}`
+  );
+  const { code, json } = fetchJson(USAGE_TOKENS_URL, {
+    method: 'post',
+    contentType: 'application/x-www-form-urlencoded',
+    payload: 'grant_type=client_credentials',
+    headers: { Authorization: `Basic ${basic}` },
+  });
+  if (code < 200 || code >= 300 || !json || !json.access_token) {
+    return null;
+  }
+  return String(json.access_token);
+}
+
+/**
+ * One bearer-authenticated GET against the X API. Returns
+ * { code, json, text } like fetchJson.
+ */
+function bearerGet_(path, query, token) {
+  const baseUrl = `${API_BASE}${path}`;
+  const queryString = Object.entries(query)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join('&');
+  const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
+  return fetchJson(url, {
+    method: 'get',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+/**
+ * The credit half of the usage data, from GET /2/usage/credits:
+ * balances in USD (total, purchased = prepaid, free) plus the free
+ * grants with their expiry when the API reports them. Every absent
+ * or non-numeric value stays null, never 0.
+ */
+export function buildUsageCredits(data) {
+  const d = data && typeof data === 'object' ? data : {};
+  const grants = Array.isArray(d.free_grants)
+    ? d.free_grants.map((g) => ({
+        amount_usd: xMetricOrNull(g && (g.amount !== undefined ? g.amount : g.amount_usd)),
+        expires_at: g && typeof g.expires_at === 'string' ? g.expires_at : null,
+      }))
+    : null;
+  return {
+    credit_balance_usd: xMetricOrNull(d.total_balance),
+    prepaid_balance_usd: xMetricOrNull(d.prepaid_balance),
+    free_balance_usd: xMetricOrNull(d.free_balance),
+    free_expires_at: typeof d.expires_at === 'string' ? d.expires_at : null,
+    free_grants: grants,
+  };
+}
+
+/**
+ * The daily half of the usage data, from GET /2/usage/tweets:
+ * one { date, tweets_consumed } entry per day, oldest first, with
+ * the per-app counts of a day summed into one number. Understands
+ * both the current shape (daily_project_usage is an array of
+ * { date, usage: [{ tweets_consumed }] }) and the legacy one
+ * (daily_project_usage.usage is an array of { date, usage }).
+ */
+export function buildUsageDaily(data) {
+  const d = data && typeof data === 'object' ? data : {};
+  let entries = null;
+  if (Array.isArray(d.daily_project_usage)) {
+    entries = d.daily_project_usage;
+  } else if (d.daily_project_usage && Array.isArray(d.daily_project_usage.usage)) {
+    entries = d.daily_project_usage.usage;
+  }
+  if (!entries) {
+    return null;
+  }
+  const daily = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry.date !== 'string') {
+      continue;
+    }
+    let consumed = null;
+    if (Array.isArray(entry.usage)) {
+      let sum = 0;
+      let seen = false;
+      for (const perApp of entry.usage) {
+        const n = xMetricOrNull(perApp && perApp.tweets_consumed);
+        if (n !== null) {
+          sum += n;
+          seen = true;
+        }
+      }
+      consumed = seen ? sum : null;
+    } else {
+      consumed = xMetricOrNull(entry.usage);
+    }
+    daily.push({ date: entry.date, tweets_consumed: consumed });
+  }
+  daily.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return daily;
+}
+
+/**
+ * Reads the X API usage for the snapshot: the credit balance
+ * (GET /2/usage/credits) and the daily post consumption
+ * (GET /2/usage/tweets). The two calls fail independently — the
+ * half that succeeded is returned, the failed half stays null and
+ * is named in the error. Returns { usage, error }; usage itself is
+ * null only when no bearer token could be minted.
+ */
+export function buildXUsage(credentials) {
+  let token = null;
+  try {
+    token = fetchXBearerToken_(credentials);
+  } catch (err) {
+    token = null;
+  }
+  if (!token) {
+    return { usage: null, error: 'usage: bearer token request failed' };
+  }
+  const usage = {
+    credit_balance_usd: null,
+    prepaid_balance_usd: null,
+    free_balance_usd: null,
+    free_expires_at: null,
+    free_grants: null,
+    daily_posts: null,
+    project_cap: null,
+  };
+  let error = null;
+  try {
+    const credits = bearerGet_('/usage/credits', {}, token);
+    const creditsData =
+      credits.json && credits.json.data && typeof credits.json.data === 'object'
+        ? credits.json.data
+        : null;
+    if (credits.code < 200 || credits.code >= 300 || !creditsData) {
+      error = `usage credits: ${summarizeXApiError(credits.code, credits.text)}`;
+    } else {
+      Object.assign(usage, buildUsageCredits(creditsData));
+    }
+  } catch (err) {
+    error = `usage credits: ${String(err && err.message ? err.message : err)}`;
+  }
+  try {
+    const tweets = bearerGet_(
+      '/usage/tweets',
+      { days: String(USAGE_TWEETS_DAYS) },
+      token
+    );
+    const tweetsData =
+      tweets.json && tweets.json.data && typeof tweets.json.data === 'object'
+        ? tweets.json.data
+        : null;
+    if (tweets.code < 200 || tweets.code >= 300 || !tweetsData) {
+      const tweetsError = `usage tweets: ${summarizeXApiError(tweets.code, tweets.text)}`;
+      error = error ? `${error}; ${tweetsError}` : tweetsError;
+    } else {
+      usage.daily_posts = buildUsageDaily(tweetsData);
+      usage.project_cap = xMetricOrNull(tweetsData.project_cap);
+    }
+  } catch (err) {
+    const tweetsError = `usage tweets: ${String(err && err.message ? err.message : err)}`;
+    error = error ? `${error}; ${tweetsError}` : tweetsError;
+  }
+  return { usage, error };
 }
 
 // --- Comment inbox ------------------------------------------------------
@@ -1919,6 +2118,8 @@ export function doPost(e) {
         posts: Array.isArray(snapshot.x.recent_posts) ? snapshot.x.recent_posts.length : null,
         x_error: snapshot.x_error,
         posts_error: snapshot.posts_error,
+        credit_balance_usd: snapshot.x_usage ? snapshot.x_usage.credit_balance_usd : null,
+        usage_error: snapshot.usage_error,
       });
       return jsonOutput({ ...snapshot, _sync: true });
     }
