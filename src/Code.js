@@ -733,6 +733,12 @@ export function buildUsageDaily(data) {
     if (!entry || typeof entry.date !== 'string') {
       continue;
     }
+    // The API reports the day as a full ISO timestamp
+    // ("2026-11-10T00:00:00.000Z"); the snapshot carries the plain
+    // YYYY-MM-DD date.
+    const date = /^\d{4}-\d{2}-\d{2}/.test(entry.date)
+      ? entry.date.slice(0, 10)
+      : entry.date;
     let consumed = null;
     if (Array.isArray(entry.usage)) {
       let sum = 0;
@@ -748,7 +754,7 @@ export function buildUsageDaily(data) {
     } else {
       consumed = xMetricOrNull(entry.usage);
     }
-    daily.push({ date: entry.date, tweets_consumed: consumed });
+    daily.push({ date, tweets_consumed: consumed });
   }
   daily.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   return daily;

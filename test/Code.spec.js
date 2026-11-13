@@ -861,6 +861,18 @@ describe('buildUsageDaily', () => {
     ]);
   });
 
+  it('normalizes ISO timestamp dates to YYYY-MM-DD', () => {
+    const out = Code.buildUsageDaily({
+      daily_project_usage: [
+        {
+          date: '2026-11-10T00:00:00.000Z',
+          usage: [{ app_id: '111', tweets_consumed: 11 }],
+        },
+      ],
+    });
+    expect(out).toEqual([{ date: '2026-11-10', tweets_consumed: 11 }]);
+  });
+
   it('returns null when no daily breakdown is present', () => {
     expect(Code.buildUsageDaily({})).toBeNull();
     expect(Code.buildUsageDaily(null)).toBeNull();
