@@ -117,13 +117,11 @@ function revokeActiveShareSessions(nowIso) {
   revokeActiveSessions(SHARE_SHEET_NAME, nowIso);
 }
 
-function issueSession(sheetName, tokenKey, { revokePrevious = true } = {}) {
+function issueSession(sheetName, tokenKey) {
   const now = new Date();
   const nowIso = now.toISOString();
   const expiresIso = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000).toISOString();
-  if (revokePrevious) {
-    revokeActiveSessions(sheetName, nowIso);
-  }
+  revokeActiveSessions(sheetName, nowIso);
   const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
   getSessionSheet(sheetName).appendRow([hashShareToken(token), nowIso, expiresIso, '', 0, '']);
   return {
@@ -177,16 +175,14 @@ function validateShareToken(token) {
 // Google ID tokens expire after about an hour, which used to drop the
 // owner back at the sign-in gate. After a Google sign-in the frontend
 // exchanges the ID token for one of these 30-day owner sessions (same
-// storage scheme as share sessions, separate sheet) and uses it for all
-// later calls. Owner sessions coexist across devices: issuing a new one
-// does NOT revoke the others (unlike share links, where reissuing must
-// invalidate the old link). The frontend revokes its own session on
-// logout.
+// storage scheme as share sessions, separate sheet) and uses it for
+// all later calls. Issuing a new one revokes the previous ones, and
+// the frontend revokes its session on logout.
 
 export const OWNER_SHEET_NAME = 'owner_sessions';
 
 function issueOwnerSession() {
-  return issueSession(OWNER_SHEET_NAME, 'session_token', { revokePrevious: false });
+  return issueSession(OWNER_SHEET_NAME, 'session_token');
 }
 
 function validateOwnerToken(token) {
@@ -339,12 +335,18 @@ function fetchJson(url, options) {
   }
   // Log everything the API returned. The query string is stripped because
   // the tokeninfo URL carries the ID token itself (claims in the response
-  // body are fine to log; the credential is not).
+  // body are fine to log; the credential is not). DM endpoints are the one
+  // exception: a DM response body must never be stored anywhere (the same
+  // rule probeDmAccess follows), so only the status is logged for them.
+  const bareUrl = url.split('?')[0];
+  const isDmEndpoint = /\/(dm_events|dm_conversations)(\/|$)/.test(bareUrl);
   logToSheet('fetch', {
     method: (options.method || 'get').toUpperCase(),
-    url: url.split('?')[0],
+    url: bareUrl,
     status: code,
-    response: text.length > LOG_DETAIL_MAX ? text.slice(0, LOG_DETAIL_MAX) + '…(truncated)' : text,
+    response: isDmEndpoint
+      ? '(not logged: DM endpoint)'
+      : text.length > LOG_DETAIL_MAX ? text.slice(0, LOG_DETAIL_MAX) + '…(truncated)' : text,
   });
   return { code, json, text };
 }
