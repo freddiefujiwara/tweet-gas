@@ -731,8 +731,14 @@ describe('sns_snapshot sync action', () => {
     expect(out.x.recent_posts[1].views).toBeNull();
     expect(out.x_error).toBeNull();
     expect(out.posts_error).toBeNull();
-    // Both requests are signed (OAuth Authorization header present).
-    for (const [, options] of mockFetch.mock.calls) {
+    // The profile and posts requests are signed (OAuth Authorization
+    // header present). The usage calls also made during the snapshot
+    // use Basic/Bearer instead and are covered by their own tests.
+    const signedCalls = mockFetch.mock.calls.filter(([url]) =>
+      String(url).includes('/users/')
+    );
+    expect(signedCalls.length).toBe(2);
+    for (const [, options] of signedCalls) {
       expect(options.headers.Authorization).toMatch(/^OAuth /);
     }
   });
@@ -777,6 +783,225 @@ describe('sns_snapshot sync action', () => {
     expect(out.dry_run).toBe(true);
     expect(out.x).toEqual({ followers: null, username: null, recent_posts: null });
     expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+// --- X API usage (credits + daily consumption) -------------------------
+
+describe('buildUsageCredits', () => {
+  it('parses balances and free grants', () => {
+    const out = Code.buildUsageCredits({
+      total_balance: 41.65,
+      prepaid_balance: 25.0,
+      free_balance: 16.65,
+      free_grants: [
+        { amount: 20.0, expires_at: '2026-12-19T02:14:28.000Z', extra: 'ignored' },
+      ],
+    });
+    expect(out).toEqual({
+      credit_balance_usd: 41.65,
+      prepaid_balance_usd: 25.0,
+      free_balance_usd: 16.65,
+      free_expires_at: null,
+      free_grants: [{ amount_usd: 20.0, expires_at: '2026-12-19T02:14:28.000Z' }],
+    });
+  });
+
+  it('keeps absent values null and reads a top-level expires_at', () => {
+    const out = Code.buildUsageCredits({
+      total_balance: '12.5',
+      expires_at: '2027-01-01T00:00:00.000Z',
+    });
+    expect(out.credit_balance_usd).toBe(12.5);
+    expect(out.prepaid_balance_usd).toBeNull();
+    expect(out.free_balance_usd).toBeNull();
+    expect(out.free_expires_at).toBe('2027-01-01T00:00:00.000Z');
+    expect(out.free_grants).toBeNull();
+  });
+
+  it('survives a missing data object', () => {
+    expect(Code.buildUsageCredits(null).credit_balance_usd).toBeNull();
+    expect(Code.buildUsageCredits(undefined).free_grants).toBeNull();
+  });
+});
+
+describe('buildUsageDaily', () => {
+  it('sums the per-app counts of the current shape and sorts by date', () => {
+    const out = Code.buildUsageDaily({
+      project_cap: 3000000,
+      daily_project_usage: [
+        {
+          date: '2026-11-12',
+          usage: [
+            { app_id: '111', tweets_consumed: 30 },
+            { app_id: '222', tweets_consumed: 12 },
+          ],
+        },
+        { date: '2026-11-11', usage: [{ app_id: '111', tweets_consumed: 7 }] },
+      ],
+    });
+    expect(out).toEqual([
+      { date: '2026-11-11', tweets_consumed: 7 },
+      { date: '2026-11-12', tweets_consumed: 42 },
+    ]);
+  });
+
+  it('reads the legacy shape (daily_project_usage.usage with string counts)', () => {
+    const out = Code.buildUsageDaily({
+      daily_project_usage: {
+        usage: [
+          { date: '2026-11-10', usage: '55' },
+          { date: '2026-11-09', usage: '3' },
+        ],
+      },
+    });
+    expect(out).toEqual([
+      { date: '2026-11-09', tweets_consumed: 3 },
+      { date: '2026-11-10', tweets_consumed: 55 },
+    ]);
+  });
+
+  it('returns null when no daily breakdown is present', () => {
+    expect(Code.buildUsageDaily({})).toBeNull();
+    expect(Code.buildUsageDaily(null)).toBeNull();
+  });
+});
+
+describe('sns_snapshot usage half', () => {
+  const event = (obj) => ({ postData: { contents: JSON.stringify(obj) } });
+  const post = (obj) => JSON.parse(Code.doPost(event(obj)).text);
+  const PROPS = { ...KEYS, SYNC_TOKEN: 'sync-secret' };
+  const BEARER = 'BEARER-SECRET-XYZ';
+
+  const ME = {
+    data: {
+      id: '1234567890',
+      username: 'freddiefujiwara',
+      public_metrics: { followers_count: 321, following_count: 45 },
+    },
+  };
+  const TWEETS = { data: [] };
+  const CREDITS = {
+    data: {
+      total_balance: 41.65,
+      prepaid_balance: 25.0,
+      free_balance: 16.65,
+      free_grants: [{ amount: 20.0, expires_at: '2026-12-19T02:14:28.000Z' }],
+    },
+  };
+  const USAGE_TWEETS = {
+    data: {
+      project_cap: 3000000,
+      daily_project_usage: [
+        { date: '2026-11-13', usage: [{ app_id: '111', tweets_consumed: 120 }] },
+        { date: '2026-11-12', usage: [{ app_id: '111', tweets_consumed: 98 }] },
+      ],
+    },
+  };
+
+  const router = (overrides = {}) => (url) => {
+    const u = String(url);
+    if (u === 'https://api.twitter.com/oauth2/token') {
+      return overrides.token
+        ? overrides.token()
+        : fetchResponse(200, { access_token: BEARER, token_type: 'bearer' });
+    }
+    if (u.startsWith('https://api.twitter.com/2/usage/credits')) {
+      return overrides.credits ? overrides.credits() : fetchResponse(200, CREDITS);
+    }
+    if (u.startsWith('https://api.twitter.com/2/usage/tweets')) {
+      return overrides.usageTweets
+        ? overrides.usageTweets()
+        : fetchResponse(200, USAGE_TWEETS);
+    }
+    if (u.startsWith('https://api.twitter.com/2/users/me')) {
+      return fetchResponse(200, ME);
+    }
+    if (u.startsWith('https://api.twitter.com/2/users/1234567890/tweets')) {
+      return fetchResponse(200, TWEETS);
+    }
+    throw new Error('unexpected fetch: ' + u);
+  };
+
+  beforeEach(() => {
+    mockGetProperty.mockImplementation((name) => PROPS[name] ?? null);
+  });
+
+  it('adds the credit balance and daily consumption to the snapshot', () => {
+    mockFetch.mockImplementation(router());
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out.ok).toBe(true);
+    expect(out.x.followers).toBe(321);
+    expect(out.usage_error).toBeNull();
+    expect(out.x_usage).toEqual({
+      credit_balance_usd: 41.65,
+      prepaid_balance_usd: 25.0,
+      free_balance_usd: 16.65,
+      free_expires_at: null,
+      free_grants: [{ amount_usd: 20.0, expires_at: '2026-12-19T02:14:28.000Z' }],
+      daily_posts: [
+        { date: '2026-11-12', tweets_consumed: 98 },
+        { date: '2026-11-13', tweets_consumed: 120 },
+      ],
+      project_cap: 3000000,
+    });
+  });
+
+  it('mints the bearer token with Basic auth and reads usage with it', () => {
+    mockFetch.mockImplementation(router());
+    post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    const tokenCall = mockFetch.mock.calls.find(
+      ([url]) => String(url) === 'https://api.twitter.com/oauth2/token'
+    );
+    expect(tokenCall).toBeTruthy();
+    const [, tokenOptions] = tokenCall;
+    expect(tokenOptions.method).toBe('post');
+    expect(tokenOptions.payload).toBe('grant_type=client_credentials');
+    expect(tokenOptions.headers.Authorization).toBe(
+      'Basic ' + Buffer.from('ck:cs').toString('base64')
+    );
+    const usageCalls = mockFetch.mock.calls.filter(([url]) =>
+      String(url).includes('/usage/')
+    );
+    expect(usageCalls).toHaveLength(2);
+    for (const [, options] of usageCalls) {
+      expect(options.headers.Authorization).toBe(`Bearer ${BEARER}`);
+    }
+    const tweetsCall = usageCalls.find(([url]) => String(url).includes('/usage/tweets'));
+    expect(String(tweetsCall[0])).toContain('days=90');
+  });
+
+  it('never writes the bearer token into the sheet log', () => {
+    mockFetch.mockImplementation(router());
+    post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(JSON.stringify(appendedRows)).not.toContain(BEARER);
+  });
+
+  it('keeps the credits when the daily usage call fails', () => {
+    mockFetch.mockImplementation(
+      router({
+        usageTweets: () =>
+          fetchResponse(429, { errors: [{ code: 88, message: 'Rate limit exceeded' }] }),
+      })
+    );
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out.ok).toBe(true);
+    expect(out.x_usage.credit_balance_usd).toBe(41.65);
+    expect(out.x_usage.daily_posts).toBeNull();
+    expect(out.usage_error).toContain('usage tweets');
+    expect(out.usage_error).toContain('HTTP 429');
+    expect(out.x.followers).toBe(321);
+  });
+
+  it('returns x_usage null when no bearer token can be minted', () => {
+    mockFetch.mockImplementation(
+      router({ token: () => fetchResponse(403, { errors: [{ message: 'Forbidden' }] }) })
+    );
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out.ok).toBe(true);
+    expect(out.x_usage).toBeNull();
+    expect(out.usage_error).toContain('bearer token');
+    expect(out.x.followers).toBe(321);
   });
 });
 
