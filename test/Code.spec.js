@@ -892,6 +892,7 @@ describe('sns_snapshot usage half', () => {
   const USAGE_TWEETS = {
     data: {
       project_cap: 3000000,
+      project_usage: '25',
       daily_project_usage: [
         { date: '2026-11-13', usage: [{ app_id: '111', tweets_consumed: 120 }] },
         { date: '2026-11-12', usage: [{ app_id: '111', tweets_consumed: 98 }] },
@@ -944,6 +945,7 @@ describe('sns_snapshot usage half', () => {
         { date: '2026-11-13', tweets_consumed: 120 },
       ],
       project_cap: 3000000,
+      cycle_posts_consumed: 25,
     });
   });
 
@@ -969,6 +971,8 @@ describe('sns_snapshot usage half', () => {
     }
     const tweetsCall = usageCalls.find(([url]) => String(url).includes('/usage/tweets'));
     expect(String(tweetsCall[0])).toContain('days=90');
+    // The daily breakdown only comes back when asked for by name.
+    expect(String(tweetsCall[0])).toContain('usage.fields=daily_project_usage');
   });
 
   it('never writes the bearer token into the sheet log', () => {
