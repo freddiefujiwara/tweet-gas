@@ -279,6 +279,25 @@ describe('spreadsheet logging', () => {
     expect(typeof time).toBe('string');
   });
 
+  it('does not log DM response bodies to the log sheet', () => {
+    mockFetch.mockReturnValue(
+      fetchResponse(200, { data: [{ id: '1', text: 'secret dm body' }] })
+    );
+    Code.signedGet('/dm_events', { max_results: '5' }, {
+      apiKey: 'k',
+      apiKeySecret: 's',
+      accessToken: 't',
+      accessTokenSecret: 'ts',
+    });
+    expect(appendedRows).toHaveLength(1);
+    const [, action, detail] = appendedRows[0];
+    expect(action).toBe('fetch');
+    const parsed = JSON.parse(detail);
+    expect(parsed.status).toBe(200);
+    expect(parsed.response).toBe('(not logged: DM endpoint)');
+    expect(detail).not.toContain('secret dm body');
+  });
+
   it('strips the query string (ID token) from logged URLs', () => {
     mockFetch.mockReturnValue(
       fetchResponse(200, { email: 'zegenvs@gmail.com', email_verified: 'true' })
@@ -537,14 +556,14 @@ describe('doPost owner sessions', () => {
     });
   });
 
-  it('keeps the previous owner session valid when a new one is exchanged', () => {
+  it('revokes the previous owner session when a new one is exchanged', () => {
     const first = exchange();
     const second = exchange();
     expect(first).not.toBe(second);
-    expect(ownerValues[1][3]).toBe('');
-    expect(ownerValues[2][3]).toBe('');
-    mockAllFetches();
-    expect(post({ session_token: first, text: 'hi' }).ok).toBe(true);
+    expect(post({ session_token: first, text: 'hi' })).toEqual({
+      ok: false,
+      error: 'unauthorized',
+    });
     mockAllFetches();
     expect(post({ session_token: second, text: 'hi' }).ok).toBe(true);
   });
