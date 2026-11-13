@@ -780,6 +780,7 @@ export function buildXUsage(credentials) {
     free_grants: null,
     daily_posts: null,
     project_cap: null,
+    cycle_posts_consumed: null,
   };
   let error = null;
   try {
@@ -797,9 +798,12 @@ export function buildXUsage(credentials) {
     error = `usage credits: ${String(err && err.message ? err.message : err)}`;
   }
   try {
+    // Without usage.fields the endpoint returns only the cycle
+    // summary (project_usage / project_cap); the daily breakdown
+    // has to be asked for explicitly.
     const tweets = bearerGet_(
       '/usage/tweets',
-      { days: String(USAGE_TWEETS_DAYS) },
+      { days: String(USAGE_TWEETS_DAYS), 'usage.fields': 'daily_project_usage' },
       token
     );
     const tweetsData =
@@ -812,6 +816,7 @@ export function buildXUsage(credentials) {
     } else {
       usage.daily_posts = buildUsageDaily(tweetsData);
       usage.project_cap = xMetricOrNull(tweetsData.project_cap);
+      usage.cycle_posts_consumed = xMetricOrNull(tweetsData.project_usage);
     }
   } catch (err) {
     const tweetsError = `usage tweets: ${String(err && err.message ? err.message : err)}`;
