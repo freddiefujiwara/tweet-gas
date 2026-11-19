@@ -347,15 +347,18 @@ function fetchJson(url, options) {
   const bareUrl = url.split('?')[0];
   const isDmEndpoint = /\/(dm_events|dm_conversations)(\/|$)/.test(bareUrl);
   const isTokenEndpoint = bareUrl.endsWith('/oauth2/token');
+  const loggedResponse = isDmEndpoint
+    ? '(not logged: DM endpoint)'
+    : isTokenEndpoint
+      ? '(not logged: credential endpoint)'
+      : text.length > LOG_DETAIL_MAX
+        ? text.slice(0, LOG_DETAIL_MAX) + '…(truncated)'
+        : text;
   logToSheet('fetch', {
     method: (options.method || 'get').toUpperCase(),
     url: bareUrl,
     status: code,
-    response: isDmEndpoint
-      ? '(not logged: DM endpoint)'
-      : isTokenEndpoint
-        ? '(not logged: credential endpoint)'
-        : text.length > LOG_DETAIL_MAX ? text.slice(0, LOG_DETAIL_MAX) + '…(truncated)' : text,
+    response: loggedResponse,
   });
   return { code, json, text };
 }
@@ -1674,6 +1677,11 @@ export function upsertDmEvents(events) {
   });
 }
 
+// One dm_state marker cell as a string, or null when empty.
+function dmStateCellOrNull_(value) {
+  return value != null && value !== '' ? String(value) : null;
+}
+
 /**
  * Reads the whole "dm_state" tab into a Map keyed by
  * conversation_id. Missing/unreadable state reads as empty, which
@@ -1687,15 +1695,8 @@ export function readDmState() {
     values.forEach((row, index) => {
       if (index > 0 && row[0] != null && row[0] !== '') {
         byConversation.set(String(row[0]), {
-          last_read_event_id:
-            row[DM_STATE_COL_LAST_READ - 1] != null && row[DM_STATE_COL_LAST_READ - 1] !== ''
-              ? String(row[DM_STATE_COL_LAST_READ - 1])
-              : null,
-          last_replied_event_id:
-            row[DM_STATE_COL_LAST_REPLIED - 1] != null &&
-            row[DM_STATE_COL_LAST_REPLIED - 1] !== ''
-              ? String(row[DM_STATE_COL_LAST_REPLIED - 1])
-              : null,
+          last_read_event_id: dmStateCellOrNull_(row[DM_STATE_COL_LAST_READ - 1]),
+          last_replied_event_id: dmStateCellOrNull_(row[DM_STATE_COL_LAST_REPLIED - 1]),
         });
       }
     });
@@ -1724,16 +1725,10 @@ export function updateDmState(conversationId, updates) {
       if (String(values[index][0]) === convId) {
         rowNumber = index + 1;
         current = {
-          last_read_event_id:
-            values[index][DM_STATE_COL_LAST_READ - 1] != null &&
-            values[index][DM_STATE_COL_LAST_READ - 1] !== ''
-              ? String(values[index][DM_STATE_COL_LAST_READ - 1])
-              : null,
-          last_replied_event_id:
-            values[index][DM_STATE_COL_LAST_REPLIED - 1] != null &&
-            values[index][DM_STATE_COL_LAST_REPLIED - 1] !== ''
-              ? String(values[index][DM_STATE_COL_LAST_REPLIED - 1])
-              : null,
+          last_read_event_id: dmStateCellOrNull_(values[index][DM_STATE_COL_LAST_READ - 1]),
+          last_replied_event_id: dmStateCellOrNull_(
+            values[index][DM_STATE_COL_LAST_REPLIED - 1]
+          ),
         };
         break;
       }
@@ -2056,6 +2051,21 @@ function jsonOutput(obj) {
   );
 }
 
+// The repeated unauthorized exit of doPost: log, then respond.
+function unauthorizedResponse_() {
+  logToSheet('doPost', { ok: false, error: 'unauthorized' });
+  return jsonOutput({ ok: false, error: 'unauthorized' });
+}
+
+// Attaches the share-session expiry marker to an action result
+// when the call came through a share link.
+function withShare_(result, shareSession) {
+  if (shareSession) {
+    result._share = { expires_at: shareSession.expires_at };
+  }
+  return result;
+}
+
 /**
  * Health check.
  */
@@ -2126,8 +2136,7 @@ export function doPost(e) {
     if (body.action === 'exchange_session') {
       const identity = verifyIdToken(body.idToken);
       if (!identity) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
       const result = issueOwnerSession();
       logToSheet('exchange_session', { ok: true, email: identity.email });
@@ -2141,8 +2150,7 @@ export function doPost(e) {
       const identity = verifyIdToken(body.idToken);
       const sessionAuth = !identity && Boolean(validateOwnerToken(body.session_token));
       if (!identity && !sessionAuth) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
       const result =
         body.action === 'issue_share' ? issueShareSession() : revokeShareSession();
@@ -2155,28 +2163,25 @@ export function doPost(e) {
     if (body.session_token) {
       ownerSession = validateOwnerToken(body.session_token);
       if (!ownerSession) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
     } else if (body.share_token) {
       shareSession = validateShareToken(body.share_token);
       if (!shareSession) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
     } else {
       identity = verifyIdToken(body.idToken);
       if (!identity) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
     }
+    const actor = identity ? identity.email : ownerSession ? '(owner session)' : '(share link)';
     if (body.action === 'validate_share') {
       // Reached only with a valid share session (see above); an ID
       // token alone cannot validate a share link.
       if (!shareSession) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
       return jsonOutput({
         ok: true,
@@ -2193,13 +2198,9 @@ export function doPost(e) {
       // Comment and DM inboxes: reached only through the user auth
       // path above (Google ID token or share session) — the sync
       // token was already rejected for anything but sns_snapshot.
-      const actor = identity ? identity.email : ownerSession ? '(owner session)' : '(share link)';
       if (body.action === 'list_dms') {
         const inbox = listDms();
-        const result = { ...inbox };
-        if (shareSession) {
-          result._share = { expires_at: shareSession.expires_at };
-        }
+        const result = withShare_({ ...inbox }, shareSession);
         logToSheet('list_dms', {
           email: actor,
           ok: true,
@@ -2210,19 +2211,13 @@ export function doPost(e) {
       }
       if (body.action === 'mark_dm_read') {
         const marked = markDmRead(body.conversation_id, body.event_id);
-        const result = { ...marked };
-        if (shareSession) {
-          result._share = { expires_at: shareSession.expires_at };
-        }
+        const result = withShare_({ ...marked }, shareSession);
         logToSheet('mark_dm_read', { email: actor, ...marked });
         return jsonOutput(result);
       }
       if (body.action === 'reply_dm') {
         const replied = replyDm(body.conversation_id, body.text);
-        const result = { ...replied };
-        if (shareSession) {
-          result._share = { expires_at: shareSession.expires_at };
-        }
+        const result = withShare_({ ...replied }, shareSession);
         // Metadata only: the reply text itself is not copied into
         // the action log (the sent event lives in the "dm" tab).
         logToSheet('reply_dm', { email: actor, ...replied });
@@ -2230,10 +2225,7 @@ export function doPost(e) {
       }
       if (body.action === 'list_comments') {
         const inbox = listComments();
-        const result = { ...inbox };
-        if (shareSession) {
-          result._share = { expires_at: shareSession.expires_at };
-        }
+        const result = withShare_({ ...inbox }, shareSession);
         logToSheet('list_comments', {
           email: actor,
           ok: true,
@@ -2246,10 +2238,7 @@ export function doPost(e) {
       const replied = replyToComment(body.comment_id, body.text, {
         asQuote: body.as_quote === true,
       });
-      const result = { ...replied };
-      if (shareSession) {
-        result._share = { expires_at: shareSession.expires_at };
-      }
+      const result = withShare_({ ...replied }, shareSession);
       logToSheet('reply_comment', { email: actor, ...result });
       return jsonOutput(result);
     }
@@ -2265,11 +2254,9 @@ export function doPost(e) {
     if (posted.dry_run) {
       result.dry_run = true;
     }
-    if (shareSession) {
-      result._share = { expires_at: shareSession.expires_at };
-    }
+    withShare_(result, shareSession);
     logToSheet('doPost', {
-      email: identity ? identity.email : ownerSession ? '(owner session)' : '(share link)',
+      email: actor,
       ...result,
     });
     return jsonOutput(result);
