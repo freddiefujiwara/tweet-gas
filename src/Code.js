@@ -67,14 +67,18 @@ function isDryRun_() {
   return value === '1' || value === 'true';
 }
 
-function getSessionSheet(sheetName) {
+function getOrCreateSheet_(sheetName, headers) {
   const ss = spreadsheet_();
   let sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
     sheet = ss.insertSheet(sheetName);
-    sheet.appendRow(SHARE_HEADERS);
+    sheet.appendRow(headers);
   }
   return sheet;
+}
+
+function getSessionSheet(sheetName) {
+  return getOrCreateSheet_(sheetName, SHARE_HEADERS);
 }
 
 function hashShareToken(token) {
@@ -215,12 +219,7 @@ function revokeOwnerSession(token) {
  */
 export function logToSheet(action, detail) {
   try {
-    const ss = spreadsheet_();
-    let sheet = ss.getSheetByName(LOG_SHEET_NAME);
-    if (!sheet) {
-      sheet = ss.insertSheet(LOG_SHEET_NAME);
-      sheet.appendRow(['time', 'action', 'detail']);
-    }
+    const sheet = getOrCreateSheet_(LOG_SHEET_NAME, ['time', 'action', 'detail']);
     sheet.appendRow([new Date().toISOString(), action, JSON.stringify(detail)]);
   } catch (e) {
     // ignore logging failures
@@ -348,15 +347,18 @@ function fetchJson(url, options) {
   const bareUrl = url.split('?')[0];
   const isDmEndpoint = /\/(dm_events|dm_conversations)(\/|$)/.test(bareUrl);
   const isTokenEndpoint = bareUrl.endsWith('/oauth2/token');
+  const loggedResponse = isDmEndpoint
+    ? '(not logged: DM endpoint)'
+    : isTokenEndpoint
+      ? '(not logged: credential endpoint)'
+      : text.length > LOG_DETAIL_MAX
+        ? text.slice(0, LOG_DETAIL_MAX) + '…(truncated)'
+        : text;
   logToSheet('fetch', {
     method: (options.method || 'get').toUpperCase(),
     url: bareUrl,
     status: code,
-    response: isDmEndpoint
-      ? '(not logged: DM endpoint)'
-      : isTokenEndpoint
-        ? '(not logged: credential endpoint)'
-        : text.length > LOG_DETAIL_MAX ? text.slice(0, LOG_DETAIL_MAX) + '…(truncated)' : text,
+    response: loggedResponse,
   });
   return { code, json, text };
 }
@@ -424,13 +426,10 @@ export function validateTweetText(text) {
 }
 
 /**
- * Posts a tweet. Returns { id, text, url }.
+ * POST /2/tweets with a JSON payload (a plain post, a reply, or
+ * a quote — the payload alone differs). Returns { id, text, url }.
  */
-export function postTweet(text) {
-  validateTweetText(text);
-  if (isDryRun_()) {
-    return { id: 'dry-run', text, url: null, dry_run: true };
-  }
+function createTweet_(payload) {
   const credentials = getCredentials();
   const url = `${API_BASE}/tweets`;
   const authorization = buildAuthorizationHeader(
@@ -441,7 +440,7 @@ export function postTweet(text) {
     method: 'post',
     contentType: 'application/json',
     headers: { Authorization: authorization },
-    payload: JSON.stringify({ text }),
+    payload: JSON.stringify(payload),
   });
   if (code < 200 || code >= 300 || !json || !json.data || !json.data.id) {
     throw new Error(`X API post failed (${code}): ${body}`);
@@ -451,6 +450,17 @@ export function postTweet(text) {
     text: json.data.text,
     url: `https://x.com/${SCREEN_NAME}/status/${json.data.id}`,
   };
+}
+
+/**
+ * Posts a tweet. Returns { id, text, url }.
+ */
+export function postTweet(text) {
+  validateTweetText(text);
+  if (isDryRun_()) {
+    return { id: 'dry-run', text, url: null, dry_run: true };
+  }
+  return createTweet_({ text });
 }
 
 /**
@@ -532,17 +542,23 @@ export function summarizeXApiError(code, text) {
  * takes them as request.query) and the request URL.
  * Returns { code, json, text } like fetchJson.
  */
-export function signedGet(path, query, credentials) {
-  const baseUrl = `${API_BASE}${path}`;
+function withQuery_(baseUrl, query) {
   const queryString = Object.entries(query)
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
     .join('&');
-  const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
+  return queryString ? `${baseUrl}?${queryString}` : baseUrl;
+}
+
+export function signedGet(path, query, credentials) {
+  const baseUrl = `${API_BASE}${path}`;
   const authorization = buildAuthorizationHeader(
     { method: 'GET', baseUrl, query },
     credentials
   );
-  return fetchJson(url, { method: 'get', headers: { Authorization: authorization } });
+  return fetchJson(withQuery_(baseUrl, query), {
+    method: 'get',
+    headers: { Authorization: authorization },
+  });
 }
 
 // A metric value as a number, or null when the API did not report
@@ -679,12 +695,7 @@ function fetchXBearerToken_(credentials) {
  * { code, json, text } like fetchJson.
  */
 function bearerGet_(path, query, token) {
-  const baseUrl = `${API_BASE}${path}`;
-  const queryString = Object.entries(query)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-    .join('&');
-  const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
-  return fetchJson(url, {
+  return fetchJson(withQuery_(`${API_BASE}${path}`, query), {
     method: 'get',
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -1100,6 +1111,25 @@ export function selectQuoteTargets(posts) {
     .map((post) => post.id);
 }
 
+// Indexes sheet data rows by their first cell (the id column),
+// skipping the header row. Shared by the inbox and DM upserts.
+function indexRowsByFirstCell_(values) {
+  const byId = new Map();
+  values.forEach((row, index) => {
+    if (index > 0 && row[0] != null && row[0] !== '') {
+      byId.set(String(row[0]), { row, rowNumber: index + 1 });
+    }
+  });
+  return byId;
+}
+
+// Writes [column, value] pairs into one sheet row.
+function setCells_(sheet, rowNumber, pairs) {
+  pairs.forEach(([col, value]) => {
+    sheet.getRange(rowNumber, col).setValue(value);
+  });
+}
+
 /**
  * Upserts comments into the inbox sheet and returns them with
  * their stored status / our_reply_id merged in. Existing rows
@@ -1115,12 +1145,7 @@ export function upsertInboxComments(comments) {
   let sheet = null;
   try {
     sheet = getInboxSheet();
-    const values = sheet.getDataRange().getValues();
-    values.forEach((row, index) => {
-      if (index > 0 && row[0] != null && row[0] !== '') {
-        existingById.set(String(row[0]), { row, rowNumber: index + 1 });
-      }
-    });
+    existingById = indexRowsByFirstCell_(sheet.getDataRange().getValues());
   } catch (e) {
     sheet = null;
     existingById = new Map();
@@ -1152,7 +1177,7 @@ export function upsertInboxComments(comments) {
     }
     try {
       if (existing) {
-        const refresh = [
+        setCells_(sheet, existing.rowNumber, [
           [2, comment.author_id],
           [3, comment.author_username],
           [4, comment.author_name],
@@ -1162,10 +1187,7 @@ export function upsertInboxComments(comments) {
           [8, comment.conversation_id],
           [INBOX_COL_LAST_SEEN_AT, nowIso],
           [INBOX_COL_KIND, merged.kind],
-        ];
-        refresh.forEach(([col, value]) => {
-          sheet.getRange(existing.rowNumber, col).setValue(value);
-        });
+        ]);
       } else {
         sheet.appendRow([
           comment.comment_id,
@@ -1207,6 +1229,20 @@ function publicInboxComment_(comment) {
 }
 
 /**
+ * The owner's own profile (GET /2/users/me), shared by the
+ * comment and DM inbox collectors. Throws the "X API profile
+ * failed" error when the read fails.
+ */
+function fetchOwnProfile_(credentials) {
+  const me = signedGet('/users/me', {}, credentials);
+  const meData = me.json && me.json.data ? me.json.data : null;
+  if (me.code < 200 || me.code >= 300 || !meData || meData.id == null) {
+    throw new Error(`X API profile failed: ${summarizeXApiError(me.code, me.text)}`);
+  }
+  return meData;
+}
+
+/**
  * Backs the "list_comments" action. Returns
  * { ok: true, comments: [...newest first], note? }.
  * Mentions failure throws (the action then reports ok:false via
@@ -1218,11 +1254,7 @@ export function listComments() {
     return { ok: true, dry_run: true, comments: [] };
   }
   const credentials = getCredentials();
-  const me = signedGet('/users/me', {}, credentials);
-  const meData = me.json && me.json.data ? me.json.data : null;
-  if (me.code < 200 || me.code >= 300 || !meData || meData.id == null) {
-    throw new Error(`X API profile failed: ${summarizeXApiError(me.code, me.text)}`);
-  }
+  const meData = fetchOwnProfile_(credentials);
   const ownId = String(meData.id);
 
   // The owner's own posts are fetched first (one call shared by
@@ -1359,31 +1391,11 @@ export function postReply(text, commentId, options = {}) {
   if (isDryRun_()) {
     return { id: 'dry-run', text, url: null, dry_run: true };
   }
-  const credentials = getCredentials();
-  const url = `${API_BASE}/tweets`;
-  const authorization = buildAuthorizationHeader(
-    { method: 'POST', baseUrl: url },
-    credentials
+  return createTweet_(
+    options.asQuote
+      ? { text, quote_tweet_id: String(commentId) }
+      : { text, reply: { in_reply_to_tweet_id: String(commentId) } }
   );
-  const { code, json, text: body } = fetchJson(url, {
-    method: 'post',
-    contentType: 'application/json',
-    headers: { Authorization: authorization },
-    payload: options.asQuote
-      ? JSON.stringify({ text, quote_tweet_id: String(commentId) })
-      : JSON.stringify({
-          text,
-          reply: { in_reply_to_tweet_id: String(commentId) },
-        }),
-  });
-  if (code < 200 || code >= 300 || !json || !json.data || !json.data.id) {
-    throw new Error(`X API post failed (${code}): ${body}`);
-  }
-  return {
-    id: json.data.id,
-    text: json.data.text,
-    url: `https://x.com/${SCREEN_NAME}/status/${json.data.id}`,
-  };
 }
 
 /**
@@ -1505,23 +1517,11 @@ export const DM_MESSAGES_PER_CONVERSATION = 20;
 export const DM_REPLY_MAX_CODE_POINTS = 10000;
 
 function getDmSheet() {
-  const ss = spreadsheet_();
-  let sheet = ss.getSheetByName(DM_SHEET_NAME);
-  if (!sheet) {
-    sheet = ss.insertSheet(DM_SHEET_NAME);
-    sheet.appendRow(DM_HEADERS);
-  }
-  return sheet;
+  return getOrCreateSheet_(DM_SHEET_NAME, DM_HEADERS);
 }
 
 function getDmStateSheet() {
-  const ss = spreadsheet_();
-  let sheet = ss.getSheetByName(DM_STATE_SHEET_NAME);
-  if (!sheet) {
-    sheet = ss.insertSheet(DM_STATE_SHEET_NAME);
-    sheet.appendRow(DM_STATE_HEADERS);
-  }
-  return sheet;
+  return getOrCreateSheet_(DM_STATE_SHEET_NAME, DM_STATE_HEADERS);
 }
 
 /**
@@ -1633,15 +1633,10 @@ function publicDmMessage_(message) {
 export function upsertDmEvents(events) {
   const nowIso = new Date().toISOString();
   let sheet = null;
-  const existingById = new Map();
+  let existingById = new Map();
   try {
     sheet = getDmSheet();
-    const values = sheet.getDataRange().getValues();
-    values.forEach((row, index) => {
-      if (index > 0 && row[0] != null && row[0] !== '') {
-        existingById.set(String(row[0]), { row, rowNumber: index + 1 });
-      }
-    });
+    existingById = indexRowsByFirstCell_(sheet.getDataRange().getValues());
   } catch (e) {
     sheet = null;
   }
@@ -1652,19 +1647,16 @@ export function upsertDmEvents(events) {
     try {
       const existing = existingById.get(event.event_id);
       if (existing) {
-        const refresh = [
+        setCells_(sheet, existing.rowNumber, [
           [2, event.conversation_id],
           [3, event.sender_id],
-          [4, event.sender_username],
-          [5, event.sender_name],
+          [4, event.sender_username == null ? '' : event.sender_username],
+          [5, event.sender_name == null ? '' : event.sender_name],
           [6, event.text],
           [7, event.created_at],
           [8, event.is_mine],
           [DM_COL_LAST_SEEN_AT, nowIso],
-        ];
-        refresh.forEach(([col, value]) => {
-          sheet.getRange(existing.rowNumber, col).setValue(value == null ? '' : value);
-        });
+        ]);
       } else {
         sheet.appendRow([
           event.event_id,
@@ -1685,6 +1677,11 @@ export function upsertDmEvents(events) {
   });
 }
 
+// One dm_state marker cell as a string, or null when empty.
+function dmStateCellOrNull_(value) {
+  return value != null && value !== '' ? String(value) : null;
+}
+
 /**
  * Reads the whole "dm_state" tab into a Map keyed by
  * conversation_id. Missing/unreadable state reads as empty, which
@@ -1698,15 +1695,8 @@ export function readDmState() {
     values.forEach((row, index) => {
       if (index > 0 && row[0] != null && row[0] !== '') {
         byConversation.set(String(row[0]), {
-          last_read_event_id:
-            row[DM_STATE_COL_LAST_READ - 1] != null && row[DM_STATE_COL_LAST_READ - 1] !== ''
-              ? String(row[DM_STATE_COL_LAST_READ - 1])
-              : null,
-          last_replied_event_id:
-            row[DM_STATE_COL_LAST_REPLIED - 1] != null &&
-            row[DM_STATE_COL_LAST_REPLIED - 1] !== ''
-              ? String(row[DM_STATE_COL_LAST_REPLIED - 1])
-              : null,
+          last_read_event_id: dmStateCellOrNull_(row[DM_STATE_COL_LAST_READ - 1]),
+          last_replied_event_id: dmStateCellOrNull_(row[DM_STATE_COL_LAST_REPLIED - 1]),
         });
       }
     });
@@ -1735,16 +1725,10 @@ export function updateDmState(conversationId, updates) {
       if (String(values[index][0]) === convId) {
         rowNumber = index + 1;
         current = {
-          last_read_event_id:
-            values[index][DM_STATE_COL_LAST_READ - 1] != null &&
-            values[index][DM_STATE_COL_LAST_READ - 1] !== ''
-              ? String(values[index][DM_STATE_COL_LAST_READ - 1])
-              : null,
-          last_replied_event_id:
-            values[index][DM_STATE_COL_LAST_REPLIED - 1] != null &&
-            values[index][DM_STATE_COL_LAST_REPLIED - 1] !== ''
-              ? String(values[index][DM_STATE_COL_LAST_REPLIED - 1])
-              : null,
+          last_read_event_id: dmStateCellOrNull_(values[index][DM_STATE_COL_LAST_READ - 1]),
+          last_replied_event_id: dmStateCellOrNull_(
+            values[index][DM_STATE_COL_LAST_REPLIED - 1]
+          ),
         };
         break;
       }
@@ -1771,11 +1755,11 @@ export function updateDmState(conversationId, updates) {
         nowIso,
       ]);
     } else {
-      sheet.getRange(rowNumber, DM_STATE_COL_LAST_READ).setValue(nextState.last_read_event_id || '');
-      sheet
-        .getRange(rowNumber, DM_STATE_COL_LAST_REPLIED)
-        .setValue(nextState.last_replied_event_id || '');
-      sheet.getRange(rowNumber, DM_STATE_COL_UPDATED_AT).setValue(nowIso);
+      setCells_(sheet, rowNumber, [
+        [DM_STATE_COL_LAST_READ, nextState.last_read_event_id || ''],
+        [DM_STATE_COL_LAST_REPLIED, nextState.last_replied_event_id || ''],
+        [DM_STATE_COL_UPDATED_AT, nowIso],
+      ]);
     }
     return nextState;
   } catch (e) {
@@ -1869,11 +1853,7 @@ export function listDms() {
     return { ok: true, dry_run: true, conversations: [] };
   }
   const credentials = getCredentials();
-  const me = signedGet('/users/me', {}, credentials);
-  const meData = me.json && me.json.data ? me.json.data : null;
-  if (me.code < 200 || me.code >= 300 || !meData || meData.id == null) {
-    throw new Error(`X API profile failed: ${summarizeXApiError(me.code, me.text)}`);
-  }
+  const meData = fetchOwnProfile_(credentials);
   const ownId = String(meData.id);
   const usersById = {
     [ownId]: {
@@ -2071,6 +2051,21 @@ function jsonOutput(obj) {
   );
 }
 
+// The repeated unauthorized exit of doPost: log, then respond.
+function unauthorizedResponse_() {
+  logToSheet('doPost', { ok: false, error: 'unauthorized' });
+  return jsonOutput({ ok: false, error: 'unauthorized' });
+}
+
+// Attaches the share-session expiry marker to an action result
+// when the call came through a share link.
+function withShare_(result, shareSession) {
+  if (shareSession) {
+    result._share = { expires_at: shareSession.expires_at };
+  }
+  return result;
+}
+
 /**
  * Health check.
  */
@@ -2141,8 +2136,7 @@ export function doPost(e) {
     if (body.action === 'exchange_session') {
       const identity = verifyIdToken(body.idToken);
       if (!identity) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
       const result = issueOwnerSession();
       logToSheet('exchange_session', { ok: true, email: identity.email });
@@ -2156,8 +2150,7 @@ export function doPost(e) {
       const identity = verifyIdToken(body.idToken);
       const sessionAuth = !identity && Boolean(validateOwnerToken(body.session_token));
       if (!identity && !sessionAuth) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
       const result =
         body.action === 'issue_share' ? issueShareSession() : revokeShareSession();
@@ -2170,28 +2163,25 @@ export function doPost(e) {
     if (body.session_token) {
       ownerSession = validateOwnerToken(body.session_token);
       if (!ownerSession) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
     } else if (body.share_token) {
       shareSession = validateShareToken(body.share_token);
       if (!shareSession) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
     } else {
       identity = verifyIdToken(body.idToken);
       if (!identity) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
     }
+    const actor = identity ? identity.email : ownerSession ? '(owner session)' : '(share link)';
     if (body.action === 'validate_share') {
       // Reached only with a valid share session (see above); an ID
       // token alone cannot validate a share link.
       if (!shareSession) {
-        logToSheet('doPost', { ok: false, error: 'unauthorized' });
-        return jsonOutput({ ok: false, error: 'unauthorized' });
+        return unauthorizedResponse_();
       }
       return jsonOutput({
         ok: true,
@@ -2208,13 +2198,9 @@ export function doPost(e) {
       // Comment and DM inboxes: reached only through the user auth
       // path above (Google ID token or share session) — the sync
       // token was already rejected for anything but sns_snapshot.
-      const actor = identity ? identity.email : ownerSession ? '(owner session)' : '(share link)';
       if (body.action === 'list_dms') {
         const inbox = listDms();
-        const result = { ...inbox };
-        if (shareSession) {
-          result._share = { expires_at: shareSession.expires_at };
-        }
+        const result = withShare_({ ...inbox }, shareSession);
         logToSheet('list_dms', {
           email: actor,
           ok: true,
@@ -2225,19 +2211,13 @@ export function doPost(e) {
       }
       if (body.action === 'mark_dm_read') {
         const marked = markDmRead(body.conversation_id, body.event_id);
-        const result = { ...marked };
-        if (shareSession) {
-          result._share = { expires_at: shareSession.expires_at };
-        }
+        const result = withShare_({ ...marked }, shareSession);
         logToSheet('mark_dm_read', { email: actor, ...marked });
         return jsonOutput(result);
       }
       if (body.action === 'reply_dm') {
         const replied = replyDm(body.conversation_id, body.text);
-        const result = { ...replied };
-        if (shareSession) {
-          result._share = { expires_at: shareSession.expires_at };
-        }
+        const result = withShare_({ ...replied }, shareSession);
         // Metadata only: the reply text itself is not copied into
         // the action log (the sent event lives in the "dm" tab).
         logToSheet('reply_dm', { email: actor, ...replied });
@@ -2245,10 +2225,7 @@ export function doPost(e) {
       }
       if (body.action === 'list_comments') {
         const inbox = listComments();
-        const result = { ...inbox };
-        if (shareSession) {
-          result._share = { expires_at: shareSession.expires_at };
-        }
+        const result = withShare_({ ...inbox }, shareSession);
         logToSheet('list_comments', {
           email: actor,
           ok: true,
@@ -2261,10 +2238,7 @@ export function doPost(e) {
       const replied = replyToComment(body.comment_id, body.text, {
         asQuote: body.as_quote === true,
       });
-      const result = { ...replied };
-      if (shareSession) {
-        result._share = { expires_at: shareSession.expires_at };
-      }
+      const result = withShare_({ ...replied }, shareSession);
       logToSheet('reply_comment', { email: actor, ...result });
       return jsonOutput(result);
     }
@@ -2280,11 +2254,9 @@ export function doPost(e) {
     if (posted.dry_run) {
       result.dry_run = true;
     }
-    if (shareSession) {
-      result._share = { expires_at: shareSession.expires_at };
-    }
+    withShare_(result, shareSession);
     logToSheet('doPost', {
-      email: identity ? identity.email : ownerSession ? '(owner session)' : '(share link)',
+      email: actor,
       ...result,
     });
     return jsonOutput(result);
