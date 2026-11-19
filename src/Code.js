@@ -67,14 +67,18 @@ function isDryRun_() {
   return value === '1' || value === 'true';
 }
 
-function getSessionSheet(sheetName) {
+function getOrCreateSheet_(sheetName, headers) {
   const ss = spreadsheet_();
   let sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
     sheet = ss.insertSheet(sheetName);
-    sheet.appendRow(SHARE_HEADERS);
+    sheet.appendRow(headers);
   }
   return sheet;
+}
+
+function getSessionSheet(sheetName) {
+  return getOrCreateSheet_(sheetName, SHARE_HEADERS);
 }
 
 function hashShareToken(token) {
@@ -215,12 +219,7 @@ function revokeOwnerSession(token) {
  */
 export function logToSheet(action, detail) {
   try {
-    const ss = spreadsheet_();
-    let sheet = ss.getSheetByName(LOG_SHEET_NAME);
-    if (!sheet) {
-      sheet = ss.insertSheet(LOG_SHEET_NAME);
-      sheet.appendRow(['time', 'action', 'detail']);
-    }
+    const sheet = getOrCreateSheet_(LOG_SHEET_NAME, ['time', 'action', 'detail']);
     sheet.appendRow([new Date().toISOString(), action, JSON.stringify(detail)]);
   } catch (e) {
     // ignore logging failures
@@ -532,17 +531,23 @@ export function summarizeXApiError(code, text) {
  * takes them as request.query) and the request URL.
  * Returns { code, json, text } like fetchJson.
  */
-export function signedGet(path, query, credentials) {
-  const baseUrl = `${API_BASE}${path}`;
+function withQuery_(baseUrl, query) {
   const queryString = Object.entries(query)
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
     .join('&');
-  const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
+  return queryString ? `${baseUrl}?${queryString}` : baseUrl;
+}
+
+export function signedGet(path, query, credentials) {
+  const baseUrl = `${API_BASE}${path}`;
   const authorization = buildAuthorizationHeader(
     { method: 'GET', baseUrl, query },
     credentials
   );
-  return fetchJson(url, { method: 'get', headers: { Authorization: authorization } });
+  return fetchJson(withQuery_(baseUrl, query), {
+    method: 'get',
+    headers: { Authorization: authorization },
+  });
 }
 
 // A metric value as a number, or null when the API did not report
@@ -679,12 +684,7 @@ function fetchXBearerToken_(credentials) {
  * { code, json, text } like fetchJson.
  */
 function bearerGet_(path, query, token) {
-  const baseUrl = `${API_BASE}${path}`;
-  const queryString = Object.entries(query)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-    .join('&');
-  const url = queryString ? `${baseUrl}?${queryString}` : baseUrl;
-  return fetchJson(url, {
+  return fetchJson(withQuery_(`${API_BASE}${path}`, query), {
     method: 'get',
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -1100,6 +1100,25 @@ export function selectQuoteTargets(posts) {
     .map((post) => post.id);
 }
 
+// Indexes sheet data rows by their first cell (the id column),
+// skipping the header row. Shared by the inbox and DM upserts.
+function indexRowsByFirstCell_(values) {
+  const byId = new Map();
+  values.forEach((row, index) => {
+    if (index > 0 && row[0] != null && row[0] !== '') {
+      byId.set(String(row[0]), { row, rowNumber: index + 1 });
+    }
+  });
+  return byId;
+}
+
+// Writes [column, value] pairs into one sheet row.
+function setCells_(sheet, rowNumber, pairs) {
+  pairs.forEach(([col, value]) => {
+    sheet.getRange(rowNumber, col).setValue(value);
+  });
+}
+
 /**
  * Upserts comments into the inbox sheet and returns them with
  * their stored status / our_reply_id merged in. Existing rows
@@ -1115,12 +1134,7 @@ export function upsertInboxComments(comments) {
   let sheet = null;
   try {
     sheet = getInboxSheet();
-    const values = sheet.getDataRange().getValues();
-    values.forEach((row, index) => {
-      if (index > 0 && row[0] != null && row[0] !== '') {
-        existingById.set(String(row[0]), { row, rowNumber: index + 1 });
-      }
-    });
+    existingById = indexRowsByFirstCell_(sheet.getDataRange().getValues());
   } catch (e) {
     sheet = null;
     existingById = new Map();
@@ -1152,7 +1166,7 @@ export function upsertInboxComments(comments) {
     }
     try {
       if (existing) {
-        const refresh = [
+        setCells_(sheet, existing.rowNumber, [
           [2, comment.author_id],
           [3, comment.author_username],
           [4, comment.author_name],
@@ -1162,10 +1176,7 @@ export function upsertInboxComments(comments) {
           [8, comment.conversation_id],
           [INBOX_COL_LAST_SEEN_AT, nowIso],
           [INBOX_COL_KIND, merged.kind],
-        ];
-        refresh.forEach(([col, value]) => {
-          sheet.getRange(existing.rowNumber, col).setValue(value);
-        });
+        ]);
       } else {
         sheet.appendRow([
           comment.comment_id,
@@ -1505,23 +1516,11 @@ export const DM_MESSAGES_PER_CONVERSATION = 20;
 export const DM_REPLY_MAX_CODE_POINTS = 10000;
 
 function getDmSheet() {
-  const ss = spreadsheet_();
-  let sheet = ss.getSheetByName(DM_SHEET_NAME);
-  if (!sheet) {
-    sheet = ss.insertSheet(DM_SHEET_NAME);
-    sheet.appendRow(DM_HEADERS);
-  }
-  return sheet;
+  return getOrCreateSheet_(DM_SHEET_NAME, DM_HEADERS);
 }
 
 function getDmStateSheet() {
-  const ss = spreadsheet_();
-  let sheet = ss.getSheetByName(DM_STATE_SHEET_NAME);
-  if (!sheet) {
-    sheet = ss.insertSheet(DM_STATE_SHEET_NAME);
-    sheet.appendRow(DM_STATE_HEADERS);
-  }
-  return sheet;
+  return getOrCreateSheet_(DM_STATE_SHEET_NAME, DM_STATE_HEADERS);
 }
 
 /**
@@ -1633,15 +1632,10 @@ function publicDmMessage_(message) {
 export function upsertDmEvents(events) {
   const nowIso = new Date().toISOString();
   let sheet = null;
-  const existingById = new Map();
+  let existingById = new Map();
   try {
     sheet = getDmSheet();
-    const values = sheet.getDataRange().getValues();
-    values.forEach((row, index) => {
-      if (index > 0 && row[0] != null && row[0] !== '') {
-        existingById.set(String(row[0]), { row, rowNumber: index + 1 });
-      }
-    });
+    existingById = indexRowsByFirstCell_(sheet.getDataRange().getValues());
   } catch (e) {
     sheet = null;
   }
@@ -1652,19 +1646,16 @@ export function upsertDmEvents(events) {
     try {
       const existing = existingById.get(event.event_id);
       if (existing) {
-        const refresh = [
+        setCells_(sheet, existing.rowNumber, [
           [2, event.conversation_id],
           [3, event.sender_id],
-          [4, event.sender_username],
-          [5, event.sender_name],
+          [4, event.sender_username == null ? '' : event.sender_username],
+          [5, event.sender_name == null ? '' : event.sender_name],
           [6, event.text],
           [7, event.created_at],
           [8, event.is_mine],
           [DM_COL_LAST_SEEN_AT, nowIso],
-        ];
-        refresh.forEach(([col, value]) => {
-          sheet.getRange(existing.rowNumber, col).setValue(value == null ? '' : value);
-        });
+        ]);
       } else {
         sheet.appendRow([
           event.event_id,
@@ -1771,11 +1762,11 @@ export function updateDmState(conversationId, updates) {
         nowIso,
       ]);
     } else {
-      sheet.getRange(rowNumber, DM_STATE_COL_LAST_READ).setValue(nextState.last_read_event_id || '');
-      sheet
-        .getRange(rowNumber, DM_STATE_COL_LAST_REPLIED)
-        .setValue(nextState.last_replied_event_id || '');
-      sheet.getRange(rowNumber, DM_STATE_COL_UPDATED_AT).setValue(nowIso);
+      setCells_(sheet, rowNumber, [
+        [DM_STATE_COL_LAST_READ, nextState.last_read_event_id || ''],
+        [DM_STATE_COL_LAST_REPLIED, nextState.last_replied_event_id || ''],
+        [DM_STATE_COL_UPDATED_AT, nowIso],
+      ]);
     }
     return nextState;
   } catch (e) {
