@@ -423,13 +423,10 @@ export function validateTweetText(text) {
 }
 
 /**
- * Posts a tweet. Returns { id, text, url }.
+ * POST /2/tweets with a JSON payload (a plain post, a reply, or
+ * a quote — the payload alone differs). Returns { id, text, url }.
  */
-export function postTweet(text) {
-  validateTweetText(text);
-  if (isDryRun_()) {
-    return { id: 'dry-run', text, url: null, dry_run: true };
-  }
+function createTweet_(payload) {
   const credentials = getCredentials();
   const url = `${API_BASE}/tweets`;
   const authorization = buildAuthorizationHeader(
@@ -440,7 +437,7 @@ export function postTweet(text) {
     method: 'post',
     contentType: 'application/json',
     headers: { Authorization: authorization },
-    payload: JSON.stringify({ text }),
+    payload: JSON.stringify(payload),
   });
   if (code < 200 || code >= 300 || !json || !json.data || !json.data.id) {
     throw new Error(`X API post failed (${code}): ${body}`);
@@ -450,6 +447,17 @@ export function postTweet(text) {
     text: json.data.text,
     url: `https://x.com/${SCREEN_NAME}/status/${json.data.id}`,
   };
+}
+
+/**
+ * Posts a tweet. Returns { id, text, url }.
+ */
+export function postTweet(text) {
+  validateTweetText(text);
+  if (isDryRun_()) {
+    return { id: 'dry-run', text, url: null, dry_run: true };
+  }
+  return createTweet_({ text });
 }
 
 /**
@@ -1218,6 +1226,20 @@ function publicInboxComment_(comment) {
 }
 
 /**
+ * The owner's own profile (GET /2/users/me), shared by the
+ * comment and DM inbox collectors. Throws the "X API profile
+ * failed" error when the read fails.
+ */
+function fetchOwnProfile_(credentials) {
+  const me = signedGet('/users/me', {}, credentials);
+  const meData = me.json && me.json.data ? me.json.data : null;
+  if (me.code < 200 || me.code >= 300 || !meData || meData.id == null) {
+    throw new Error(`X API profile failed: ${summarizeXApiError(me.code, me.text)}`);
+  }
+  return meData;
+}
+
+/**
  * Backs the "list_comments" action. Returns
  * { ok: true, comments: [...newest first], note? }.
  * Mentions failure throws (the action then reports ok:false via
@@ -1229,11 +1251,7 @@ export function listComments() {
     return { ok: true, dry_run: true, comments: [] };
   }
   const credentials = getCredentials();
-  const me = signedGet('/users/me', {}, credentials);
-  const meData = me.json && me.json.data ? me.json.data : null;
-  if (me.code < 200 || me.code >= 300 || !meData || meData.id == null) {
-    throw new Error(`X API profile failed: ${summarizeXApiError(me.code, me.text)}`);
-  }
+  const meData = fetchOwnProfile_(credentials);
   const ownId = String(meData.id);
 
   // The owner's own posts are fetched first (one call shared by
@@ -1370,31 +1388,11 @@ export function postReply(text, commentId, options = {}) {
   if (isDryRun_()) {
     return { id: 'dry-run', text, url: null, dry_run: true };
   }
-  const credentials = getCredentials();
-  const url = `${API_BASE}/tweets`;
-  const authorization = buildAuthorizationHeader(
-    { method: 'POST', baseUrl: url },
-    credentials
+  return createTweet_(
+    options.asQuote
+      ? { text, quote_tweet_id: String(commentId) }
+      : { text, reply: { in_reply_to_tweet_id: String(commentId) } }
   );
-  const { code, json, text: body } = fetchJson(url, {
-    method: 'post',
-    contentType: 'application/json',
-    headers: { Authorization: authorization },
-    payload: options.asQuote
-      ? JSON.stringify({ text, quote_tweet_id: String(commentId) })
-      : JSON.stringify({
-          text,
-          reply: { in_reply_to_tweet_id: String(commentId) },
-        }),
-  });
-  if (code < 200 || code >= 300 || !json || !json.data || !json.data.id) {
-    throw new Error(`X API post failed (${code}): ${body}`);
-  }
-  return {
-    id: json.data.id,
-    text: json.data.text,
-    url: `https://x.com/${SCREEN_NAME}/status/${json.data.id}`,
-  };
 }
 
 /**
@@ -1860,11 +1858,7 @@ export function listDms() {
     return { ok: true, dry_run: true, conversations: [] };
   }
   const credentials = getCredentials();
-  const me = signedGet('/users/me', {}, credentials);
-  const meData = me.json && me.json.data ? me.json.data : null;
-  if (me.code < 200 || me.code >= 300 || !meData || meData.id == null) {
-    throw new Error(`X API profile failed: ${summarizeXApiError(me.code, me.text)}`);
-  }
+  const meData = fetchOwnProfile_(credentials);
   const ownId = String(meData.id);
   const usersById = {
     [ownId]: {
