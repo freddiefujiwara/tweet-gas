@@ -522,16 +522,24 @@ export function summarizeXApiError(code, text) {
   const errors = parsed && Array.isArray(parsed.errors) ? parsed.errors : null;
   if (errors && errors.length) {
     const first = errors[0] || {};
-    if (first.code !== undefined && first.code !== null) {
-      summary += ` code=${first.code}`;
+    const code = xTextOr_(first.code, null);
+    if (code !== null) {
+      summary += ` code=${code}`;
     }
-    if (first.message) {
-      summary += `: ${String(first.message).slice(0, 200)}`;
+    const message = first.message ? xTextOr_(first.message, '') : '';
+    if (message) {
+      summary += `: ${message.slice(0, 200)}`;
     }
   } else if (parsed && parsed.detail) {
-    summary += `: ${String(parsed.detail).slice(0, 200)}`;
+    const detail = xTextOr_(parsed.detail, '');
+    if (detail) {
+      summary += `: ${detail.slice(0, 200)}`;
+    }
   } else if (parsed && parsed.title) {
-    summary += `: ${String(parsed.title).slice(0, 200)}`;
+    const title = xTextOr_(parsed.title, '');
+    if (title) {
+      summary += `: ${title.slice(0, 200)}`;
+    }
   }
   return summary;
 }
@@ -562,13 +570,40 @@ export function signedGet(path, query, credentials) {
 }
 
 // A metric value as a number, or null when the API did not report
-// one (absent and non-numeric both read as null, never as 0).
+// one (absent and non-numeric both read as null, never as 0). Only
+// finite numbers and non-blank numeric strings count: a bare
+// Number() would invent values from the other JSON shapes
+// (Number(true) is 1, Number([5]) is 5, Number('') is 0) and throw
+// on an object whose toString is not a function.
 const xMetricOrNull = (value) => {
-  if (value === null || value === undefined) {
-    return null;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
   }
-  const num = Number(value);
-  return Number.isFinite(num) ? num : null;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  }
+  return null;
+};
+
+// A text field of an outside payload (X API JSON, a request body)
+// as a string: strings pass through and numbers/booleans stringify
+// exactly as String() always made them, but objects and arrays
+// read as the fallback — String() on them either leaks
+// "[object Object]" / "a,b" into stored data or throws outright
+// when their toString is not a function, which JSON input can
+// produce (JSON.parse('{"toString":[]}')).
+const xTextOr_ = (value, fallback) => {
+  if (value === null || value === undefined) {
+    return fallback;
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return fallback;
 };
 
 /**
@@ -578,9 +613,12 @@ const xMetricOrNull = (value) => {
 export function buildSnsSnapshotPost(tweet) {
   const metrics = (tweet && tweet.public_metrics) || {};
   return {
-    id: tweet && tweet.id != null ? String(tweet.id) : null,
-    posted_at: (tweet && tweet.created_at) || null,
-    text: tweet && tweet.text != null ? String(tweet.text) : '',
+    id: xTextOr_(tweet && tweet.id, null),
+    posted_at:
+      tweet && typeof tweet.created_at === 'string' && tweet.created_at
+        ? tweet.created_at
+        : null,
+    text: xTextOr_(tweet && tweet.text, ''),
     views: xMetricOrNull(metrics.impression_count),
     likes: xMetricOrNull(metrics.like_count),
     reposts: xMetricOrNull(metrics.retweet_count),
@@ -754,6 +792,23 @@ export function buildUsageDaily(data) {
     const date = /^\d{4}-\d{2}-\d{2}/.test(entry.date)
       ? entry.date.slice(0, 10)
       : entry.date;
+    // A day that does not exist (2026-02-30, month 13) is skipped:
+    // the API reports real days only, so an impossible date means
+    // the payload is deformed and the day must not enter the series.
+    const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+    if (dateMatch) {
+      const year = Number(dateMatch[1]);
+      const month = Number(dateMatch[2]);
+      const day = Number(dateMatch[3]);
+      const probe = new Date(Date.UTC(year, month - 1, day));
+      if (
+        probe.getUTCFullYear() !== year ||
+        probe.getUTCMonth() !== month - 1 ||
+        probe.getUTCDate() !== day
+      ) {
+        continue;
+      }
+    }
     let consumed = null;
     if (Array.isArray(entry.usage)) {
       let sum = 0;
@@ -957,17 +1012,23 @@ function getInboxSheet() {
 export function determineInboxKind(tweet, ownPostIds, sourceKind) {
   const referenced =
     tweet && Array.isArray(tweet.referenced_tweets) ? tweet.referenced_tweets : [];
-  const ownSet =
+  const ownList =
     ownPostIds == null
       ? null
-      : new Set((Array.isArray(ownPostIds) ? ownPostIds : [...ownPostIds]).map(String));
-  const quotesOwnPost = referenced.some(
-    (ref) =>
-      ref &&
-      ref.type === 'quoted' &&
-      ref.id != null &&
-      (ownSet === null || ownSet.has(String(ref.id)))
-  );
+      : Array.isArray(ownPostIds) || ownPostIds instanceof Set
+        ? [...ownPostIds]
+        : [];
+  const ownSet =
+    ownList === null
+      ? null
+      : new Set(ownList.map((id) => xTextOr_(id, null)).filter((id) => id !== null));
+  const quotesOwnPost = referenced.some((ref) => {
+    if (!ref || ref.type !== 'quoted') {
+      return false;
+    }
+    const refId = xTextOr_(ref.id, null);
+    return refId !== null && (ownSet === null || ownSet.has(refId));
+  });
   if (quotesOwnPost) {
     return 'quote';
   }
@@ -1013,10 +1074,11 @@ function usersByIdFromIncludes_(json) {
   const list =
     json && json.includes && Array.isArray(json.includes.users) ? json.includes.users : [];
   list.forEach((user) => {
-    if (user && user.id != null) {
-      users[String(user.id)] = {
-        username: user.username != null ? String(user.username) : '',
-        name: user.name != null ? String(user.name) : '',
+    const id = user ? xTextOr_(user.id, null) : null;
+    if (id !== null) {
+      users[id] = {
+        username: xTextOr_(user.username, ''),
+        name: xTextOr_(user.name, ''),
       };
     }
   });
@@ -1036,7 +1098,11 @@ export function normalizeInboxComment(tweet, usersById, ownId, options = {}) {
   if (!tweet || tweet.id == null) {
     return null;
   }
-  const authorId = tweet.author_id != null ? String(tweet.author_id) : '';
+  const commentId = xTextOr_(tweet.id, null);
+  if (commentId === null) {
+    return null;
+  }
+  const authorId = xTextOr_(tweet.author_id, '');
   if (authorId && String(ownId) === authorId) {
     return null;
   }
@@ -1044,21 +1110,21 @@ export function normalizeInboxComment(tweet, usersById, ownId, options = {}) {
   if (referenced.some((ref) => ref && ref.type === 'retweeted')) {
     return null;
   }
-  const text = tweet.text != null ? String(tweet.text) : '';
+  const text = xTextOr_(tweet.text, '');
   if (referenced.length === 0 && text.startsWith('RT @')) {
     return null;
   }
   const repliedTo = referenced.find((ref) => ref && ref.type === 'replied_to');
   const author = (usersById && usersById[authorId]) || {};
   return {
-    comment_id: String(tweet.id),
+    comment_id: commentId,
     author_id: authorId,
-    author_username: author.username || '',
-    author_name: author.name || '',
+    author_username: author.username ? xTextOr_(author.username, '') : '',
+    author_name: author.name ? xTextOr_(author.name, '') : '',
     text,
-    created_at: tweet.created_at || '',
-    in_reply_to_tweet_id: repliedTo && repliedTo.id != null ? String(repliedTo.id) : '',
-    conversation_id: tweet.conversation_id != null ? String(tweet.conversation_id) : '',
+    created_at: typeof tweet.created_at === 'string' ? tweet.created_at : '',
+    in_reply_to_tweet_id: repliedTo ? xTextOr_(repliedTo.id, '') : '',
+    conversation_id: xTextOr_(tweet.conversation_id, ''),
     kind: determineInboxKind(tweet, options.ownPostIds, options.sourceKind),
   };
 }
@@ -1080,8 +1146,14 @@ function normalizeInboxComments_(json, ownId, options = {}) {
 export function selectConversationSearchTargets(posts, nowMs) {
   const cutoff = nowMs - INBOX_SEARCH_WINDOW_DAYS * 24 * 60 * 60 * 1000;
   return (Array.isArray(posts) ? posts : [])
-    .filter((post) => post && post.id != null && post.created_at)
-    .map((post) => ({ id: String(post.id), createdMs: Date.parse(post.created_at) }))
+    .filter(
+      (post) =>
+        post &&
+        xTextOr_(post.id, null) !== null &&
+        typeof post.created_at === 'string' &&
+        post.created_at
+    )
+    .map((post) => ({ id: xTextOr_(post.id, null), createdMs: Date.parse(post.created_at) }))
     .filter((post) => Number.isFinite(post.createdMs) && post.createdMs >= cutoff)
     .sort((a, b) => b.createdMs - a.createdMs)
     .slice(0, INBOX_SEARCH_POSTS_LIMIT)
@@ -1098,9 +1170,15 @@ export function selectConversationSearchTargets(posts, nowMs) {
  */
 export function selectQuoteTargets(posts) {
   return (Array.isArray(posts) ? posts : [])
-    .filter((post) => post && post.id != null && post.created_at)
+    .filter(
+      (post) =>
+        post &&
+        xTextOr_(post.id, null) !== null &&
+        typeof post.created_at === 'string' &&
+        post.created_at
+    )
     .map((post) => ({
-      id: String(post.id),
+      id: xTextOr_(post.id, null),
       createdMs: Date.parse(post.created_at),
       quoteCount: xMetricOrNull(post.public_metrics ? post.public_metrics.quote_count : null),
     }))
@@ -1150,8 +1228,12 @@ export function upsertInboxComments(comments) {
     sheet = null;
     existingById = new Map();
   }
-  return (Array.isArray(comments) ? comments : []).map((comment) => {
-    const existing = existingById.get(comment.comment_id);
+  return (Array.isArray(comments) ? comments : [])
+    .map((comment) => {
+      if (!comment || typeof comment !== 'object') {
+        return null;
+      }
+      const existing = existingById.get(comment.comment_id);
     // The kind is merged by priority and never taken from a single
     // side alone: a stored "quote" survives a later mention/reply
     // re-collection, a legacy row (kind still empty) adopts the
@@ -1208,8 +1290,9 @@ export function upsertInboxComments(comments) {
     } catch (e) {
       // one bad row must not lose the rest of the batch
     }
-    return merged;
-  });
+      return merged;
+    })
+    .filter((merged) => merged !== null);
 }
 
 function publicInboxComment_(comment) {
@@ -1276,7 +1359,9 @@ export function listComments() {
     ownPosts.code >= 200 && ownPosts.code < 300 && ownPosts.json && Array.isArray(ownPosts.json.data)
       ? ownPosts.json.data
       : null;
-  const ownPostIds = ownItems ? ownItems.map((post) => String(post.id)) : null;
+  const ownPostIds = ownItems
+    ? ownItems.map((post) => xTextOr_(post && post.id, null)).filter((id) => id !== null)
+    : null;
 
   const mentions = signedGet(
     `/users/${encodeURIComponent(ownId)}/mentions`,
@@ -1383,9 +1468,18 @@ export function listComments() {
  * With options.asQuote the post quotes commentId instead:
  * the payload carries quote_tweet_id and no reply object at all.
  */
+// An action target id (tweet / conversation / event id) from a
+// request body, as text: strings and numbers only. An array or
+// object must never be String()-coerced into a target —
+// String(['123']) is '123', which would silently reply to / send
+// into / mark a target the caller never named — and an object
+// whose toString is not a function throws inside String().
+const idTextOrEmpty_ = (value) =>
+  typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+
 export function postReply(text, commentId, options = {}) {
   validateTweetText(text);
-  if (!commentId || String(commentId).trim() === '') {
+  if (!commentId || idTextOrEmpty_(commentId).trim() === '') {
     throw new Error('comment_id is empty');
   }
   if (isDryRun_()) {
@@ -1568,10 +1662,11 @@ function dmUsersById_(json) {
   const list =
     json && json.includes && Array.isArray(json.includes.users) ? json.includes.users : [];
   list.forEach((user) => {
-    if (user && user.id != null) {
-      users[String(user.id)] = {
-        username: user.username != null ? String(user.username) : null,
-        name: user.name != null ? String(user.name) : null,
+    const id = user ? xTextOr_(user.id, null) : null;
+    if (id !== null) {
+      users[id] = {
+        username: xTextOr_(user.username, null),
+        name: xTextOr_(user.name, null),
       };
     }
   });
@@ -1591,22 +1686,27 @@ export function normalizeDmEvent(raw, usersById, ownId) {
   if (!raw || raw.id == null || raw.dm_conversation_id == null) {
     return null;
   }
+  const eventId = xTextOr_(raw.id, null);
+  const conversationId = xTextOr_(raw.dm_conversation_id, null);
+  if (eventId === null || conversationId === null) {
+    return null;
+  }
   if (raw.event_type && raw.event_type !== 'MessageCreate') {
     return null;
   }
-  const senderId = raw.sender_id != null ? String(raw.sender_id) : '';
+  const senderId = xTextOr_(raw.sender_id, '');
   const sender = (usersById && usersById[senderId]) || {};
   return {
-    event_id: String(raw.id),
-    conversation_id: String(raw.dm_conversation_id),
+    event_id: eventId,
+    conversation_id: conversationId,
     sender_id: senderId,
     sender_username: sender.username != null ? sender.username : null,
     sender_name: sender.name != null ? sender.name : null,
-    text: raw.text != null ? String(raw.text) : '',
-    created_at: raw.created_at || '',
+    text: xTextOr_(raw.text, ''),
+    created_at: typeof raw.created_at === 'string' ? raw.created_at : '',
     is_mine: senderId !== '' && String(ownId) === senderId,
     participant_ids: Array.isArray(raw.participant_ids)
-      ? raw.participant_ids.map((id) => String(id))
+      ? raw.participant_ids.map((id) => xTextOr_(id, null)).filter((id) => id !== null)
       : [],
   };
 }
@@ -1778,6 +1878,9 @@ export function updateDmState(conversationId, updates) {
 export function buildDmConversations(events, stateByConversation, usersById, ownId) {
   const groups = new Map();
   (Array.isArray(events) ? events : []).forEach((event) => {
+    if (!event || typeof event !== 'object') {
+      return;
+    }
     if (!groups.has(event.conversation_id)) {
       groups.set(event.conversation_id, []);
     }
@@ -1905,10 +2008,10 @@ export function listDms() {
  * Under DRY_RUN nothing is written.
  */
 export function markDmRead(conversationId, eventId) {
-  if (!conversationId || String(conversationId).trim() === '') {
+  if (!conversationId || idTextOrEmpty_(conversationId).trim() === '') {
     throw new Error('conversation_id is empty');
   }
-  if (!eventId || String(eventId).trim() === '') {
+  if (!eventId || idTextOrEmpty_(eventId).trim() === '') {
     throw new Error('event_id is empty');
   }
   const result = {
@@ -1953,7 +2056,7 @@ export function validateDmText(text) {
  */
 export function postDmMessage(conversationId, text) {
   validateDmText(text);
-  if (!conversationId || String(conversationId).trim() === '') {
+  if (!conversationId || idTextOrEmpty_(conversationId).trim() === '') {
     throw new Error('conversation_id is empty');
   }
   if (isDryRun_()) {
@@ -2312,11 +2415,13 @@ export function summarizeDmProbeResponse(code, text) {
     }
     return result;
   }
-  if (parsed.title) {
-    result.title = String(parsed.title).slice(0, 200);
+  const title = parsed.title ? xTextOr_(parsed.title, '') : '';
+  if (title) {
+    result.title = title.slice(0, 200);
   }
-  if (parsed.detail) {
-    result.detail = String(parsed.detail).slice(0, 200);
+  const detail = parsed.detail ? xTextOr_(parsed.detail, '') : '';
+  if (detail) {
+    result.detail = detail.slice(0, 200);
   }
   if (
     !result.title &&
@@ -2325,8 +2430,9 @@ export function summarizeDmProbeResponse(code, text) {
     parsed.errors.length
   ) {
     const first = parsed.errors[0] || {};
-    if (first.message) {
-      result.detail = String(first.message).slice(0, 200);
+    const message = first.message ? xTextOr_(first.message, '') : '';
+    if (message) {
+      result.detail = message.slice(0, 200);
     }
   }
   return result;
