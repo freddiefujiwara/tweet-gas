@@ -625,6 +625,138 @@ export function buildSnsSnapshotPost(tweet) {
   };
 }
 
+// --- Snapshot log merge -------------------------------------------------
+// The user-timeline read below can silently omit a post that
+// exists — observed 2026-11-24: the owner's pinned article
+// announcement (posted through this app the previous evening)
+// never appeared in GET /2/users/:id/tweets, so social-gas
+// never collected it. Every original post made through this
+// app is in its own log sheet, though (the doPost handler logs
+// the new post's id), so the snapshot unions those ids in: a
+// logged post the timeline did not return is fetched by id
+// (one batch lookup) and merged into recent_posts. The merge
+// is best-effort — any failure along the way (sheet unreadable,
+// lookup failed) keeps the timeline result exactly as it was.
+
+export const SNS_SNAPSHOT_LOG_IDS_LIMIT = 20;
+
+// How many trailing log rows the merge scans. The log takes a
+// row per action (the hourly snapshot alone adds 24 a day), so
+// the scan stays on the tail; original posts are a few a day at
+// most, and this window always covers the newest logged posts.
+export const SNS_SNAPSHOT_LOG_SCAN_ROWS = 600;
+
+/**
+ * The post ids of successful original posts in log-sheet
+ * values ([time, action, detail] rows, oldest first): newest
+ * first, duplicates removed, capped at `limit`. Only the
+ * doPost action counts — it is the plain-post path; replies
+ * (reply_comment) and DMs stay out, exactly as the timeline's
+ * exclude=replies keeps them out. Rows whose detail is not the
+ * JSON of a successful post are skipped.
+ */
+export function extractLoggedPostIds(rows, limit = SNS_SNAPSHOT_LOG_IDS_LIMIT) {
+  const ids = [];
+  const seen = new Set();
+  const list = Array.isArray(rows) ? rows : [];
+  for (let i = list.length - 1; i >= 0 && ids.length < limit; i--) {
+    const row = list[i];
+    if (!Array.isArray(row) || row[1] !== 'doPost') {
+      continue;
+    }
+    let detail = null;
+    try {
+      detail = JSON.parse(row[2]);
+    } catch (e) {
+      detail = null;
+    }
+    if (!detail || detail.ok !== true || detail.dry_run) {
+      continue;
+    }
+    const id = detail.id != null ? String(detail.id) : '';
+    if (!id || id === 'dry-run' || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * Timeline posts plus extra posts (the logged ones the timeline
+ * missed), as one list: deduplicated by id (the timeline entry
+ * wins), newest first by posted_at, capped at `limit`. Entries
+ * without an id are dropped; a missing posted_at sorts oldest.
+ */
+export function mergeSnapshotPosts(
+  posts,
+  extraPosts,
+  limit = SNS_SNAPSHOT_POSTS_LIMIT
+) {
+  const byId = new Map();
+  const all = [
+    ...(Array.isArray(posts) ? posts : []),
+    ...(Array.isArray(extraPosts) ? extraPosts : []),
+  ];
+  for (const post of all) {
+    if (post && post.id != null && String(post.id) !== '') {
+      const key = String(post.id);
+      if (!byId.has(key)) {
+        byId.set(key, post);
+      }
+    }
+  }
+  return [...byId.values()]
+    .sort((a, b) =>
+      String(b.posted_at || '').localeCompare(String(a.posted_at || ''))
+    )
+    .slice(0, limit);
+}
+
+/**
+ * The snapshot entries for logged posts the timeline did not
+ * return, or [] when there is nothing to add or anything along
+ * the way fails. Reads the tail of the log sheet, takes the
+ * successful original-post ids, and batch-fetches the missing
+ * ones by id (GET /2/tweets?ids=…). A post deleted since it was
+ * logged simply does not come back from the lookup and stays
+ * out. Never throws.
+ */
+function fetchLoggedOnlyPosts_(credentials, timelineItems) {
+  try {
+    const sheet = getOrCreateSheet_(LOG_SHEET_NAME, ['time', 'action', 'detail']);
+    const values = sheet.getDataRange().getValues();
+    const loggedIds = extractLoggedPostIds(
+      values.slice(-SNS_SNAPSHOT_LOG_SCAN_ROWS)
+    );
+    if (!loggedIds.length) {
+      return [];
+    }
+    const known = new Set(
+      (Array.isArray(timelineItems) ? timelineItems : []).map((item) =>
+        item && item.id != null ? String(item.id) : ''
+      )
+    );
+    const missing = loggedIds.filter((id) => !known.has(id));
+    if (!missing.length) {
+      return [];
+    }
+    const res = signedGet(
+      '/tweets',
+      { ids: missing.join(','), 'tweet.fields': 'created_at,public_metrics' },
+      credentials
+    );
+    const items = res.json && Array.isArray(res.json.data) ? res.json.data : null;
+    if (res.code < 200 || res.code >= 300 || !items) {
+      return [];
+    }
+    return items.map(buildSnsSnapshotPost);
+  } catch (e) {
+    return [];
+  }
+}
+
 /**
  * The X numbers social-gas collects hourly: the owner's follower
  * count and newest posts with their public metrics, read with the
@@ -688,7 +820,9 @@ export function buildSnsSnapshot() {
     snapshot.posts_error = `x posts: ${summarizeXApiError(list.code, list.text)}`;
     return snapshot;
   }
-  snapshot.x.recent_posts = items.map(buildSnsSnapshotPost);
+  const timelinePosts = items.map(buildSnsSnapshotPost);
+  const loggedOnlyPosts = fetchLoggedOnlyPosts_(credentials, items);
+  snapshot.x.recent_posts = mergeSnapshotPosts(timelinePosts, loggedOnlyPosts);
   return snapshot;
 }
 
