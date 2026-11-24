@@ -795,6 +795,176 @@ describe('sns_snapshot sync action', () => {
   });
 });
 
+// --- SNS snapshot log merge --------------------------------------------
+
+describe('extractLoggedPostIds', () => {
+  const row = (action, detail) => [
+    '2026-11-24T00:00:00.000Z',
+    action,
+    typeof detail === 'string' ? detail : JSON.stringify(detail),
+  ];
+
+  it('takes successful doPost ids, newest first, deduplicated', () => {
+    const rows = [
+      ['time', 'action', 'detail'],
+      row('doPost', { ok: true, id: '1001' }),
+      row('doPost', { ok: true, id: '1001' }),
+      row('fetch', { ok: true }),
+      row('doPost', { ok: true, id: '1002' }),
+    ];
+    expect(Code.extractLoggedPostIds(rows)).toEqual(['1002', '1001']);
+  });
+
+  it('skips failures, dry runs, replies and broken rows', () => {
+    const rows = [
+      row('doPost', { ok: false, error: 'boom' }),
+      row('doPost', { ok: true, id: 'dry-run', dry_run: true }),
+      row('reply_comment', { ok: true, id: '1003' }),
+      row('doPost', 'not json'),
+      row('doPost', { ok: true }),
+    ];
+    expect(Code.extractLoggedPostIds(rows)).toEqual([]);
+  });
+});
+
+describe('mergeSnapshotPosts', () => {
+  const post = (id, posted_at) => ({
+    id,
+    posted_at,
+    text: '',
+    views: null,
+    likes: null,
+    reposts: null,
+    replies: null,
+  });
+
+  it('unions, dedupes (timeline wins), sorts newest first and caps', () => {
+    const timeline = [
+      post('2', '2026-11-09T10:00:00.000Z'),
+      post('1', '2026-11-08T10:00:00.000Z'),
+    ];
+    const extra = [
+      post('3', '2026-11-10T10:00:00.000Z'),
+      post('2', '2026-11-09T10:00:00.000Z'),
+    ];
+    const merged = Code.mergeSnapshotPosts(timeline, extra, 2);
+    expect(merged.map((p) => p.id)).toEqual(['3', '2']);
+    expect(merged[1]).toBe(timeline[0]);
+  });
+});
+
+describe('sns_snapshot log merge (integration)', () => {
+  const event = (obj) => ({ postData: { contents: JSON.stringify(obj) } });
+  const post = (obj) => JSON.parse(Code.doPost(event(obj)).text);
+
+  const PROPS = {
+    ...KEYS,
+    SYNC_TOKEN: 'sync-secret',
+  };
+
+  const ME = {
+    data: {
+      id: '1234567890',
+      username: 'freddiefujiwara',
+      public_metrics: { followers_count: 321, following_count: 45 },
+    },
+  };
+  const TWEETS = {
+    data: [
+      {
+        id: '2001',
+        created_at: '2026-11-09T10:00:00.000Z',
+        text: 'タイムラインの投稿',
+        public_metrics: {
+          impression_count: 500,
+          like_count: 12,
+          retweet_count: 3,
+          reply_count: 2,
+        },
+      },
+    ],
+  };
+  const LOGGED = {
+    data: [
+      {
+        id: '2003',
+        created_at: '2026-11-10T10:00:00.000Z',
+        text: 'ピン留めの告知',
+        public_metrics: {
+          impression_count: 42,
+          like_count: 1,
+          retweet_count: 0,
+          reply_count: 0,
+        },
+      },
+    ],
+  };
+
+  let logRows = [];
+  let lookupCalls = 0;
+
+  beforeEach(() => {
+    mockGetProperty.mockImplementation((name) => PROPS[name] ?? null);
+    lookupCalls = 0;
+    logRows = [
+      ['time', 'action', 'detail'],
+      [
+        '2026-11-10T10:00:01.000Z',
+        'doPost',
+        JSON.stringify({ ok: true, id: '2003' }),
+      ],
+    ];
+    const logSheet = {
+      appendRow: () => {},
+      getDataRange: () => ({ getValues: () => logRows }),
+    };
+    global.SpreadsheetApp = {
+      getActiveSpreadsheet: () => ({
+        getSheetByName: (name) => (name === 'log' ? logSheet : mockSheet),
+        insertSheet: () => logSheet,
+      }),
+    };
+    mockFetch.mockImplementation((url) => {
+      const u = String(url);
+      if (u.startsWith('https://api.twitter.com/2/users/me')) {
+        return fetchResponse(200, ME);
+      }
+      if (u.startsWith('https://api.twitter.com/2/users/1234567890/tweets')) {
+        return fetchResponse(200, TWEETS);
+      }
+      if (u.startsWith('https://api.twitter.com/2/tweets?')) {
+        lookupCalls += 1;
+        return fetchResponse(200, LOGGED);
+      }
+      throw new Error('unexpected fetch: ' + u);
+    });
+  });
+
+  it('unions a logged post the timeline omitted into recent_posts', () => {
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out.ok).toBe(true);
+    expect(out.posts_error).toBeNull();
+    expect(out.x.recent_posts.map((p) => p.id)).toEqual(['2003', '2001']);
+    expect(out.x.recent_posts[0]).toMatchObject({ text: 'ピン留めの告知', views: 42 });
+    expect(lookupCalls).toBe(1);
+  });
+
+  it('makes no lookup call when every logged post is in the timeline', () => {
+    logRows = [
+      ['time', 'action', 'detail'],
+      [
+        '2026-11-09T10:00:01.000Z',
+        'doPost',
+        JSON.stringify({ ok: true, id: '2001' }),
+      ],
+    ];
+    const out = post({ sync_token: 'sync-secret', action: 'sns_snapshot' });
+    expect(out.ok).toBe(true);
+    expect(out.x.recent_posts.map((p) => p.id)).toEqual(['2001']);
+    expect(lookupCalls).toBe(0);
+  });
+});
+
 // --- X API usage (credits + daily consumption) -------------------------
 
 describe('buildUsageCredits', () => {
