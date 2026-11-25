@@ -221,6 +221,21 @@ describe('verifyIdToken', () => {
     expect(Code.verifyIdToken('token')).toBeNull();
   });
 
+  it('accepts any email from a comma-separated ALLOWED_EMAIL list', () => {
+    mockFetch.mockReturnValue(
+      fetchResponse(200, { email: 'second@example.com', email_verified: 'true', aud: 'cid' })
+    );
+    mockGetProperty.mockImplementation((name) =>
+      name === 'ALLOWED_EMAIL'
+        ? 'owner@example.com, second@example.com'
+        : name === 'GOOGLE_CLIENT_ID'
+          ? 'cid'
+          : (KEYS[name] ?? null)
+    );
+    const payload = Code.verifyIdToken('token');
+    expect(payload.email).toBe('second@example.com');
+  });
+
   it('rejects other emails', () => {
     mockFetch.mockReturnValue(
       fetchResponse(200, { email: 'someone@example.com', email_verified: 'true' })

@@ -2275,10 +2275,16 @@ export function verifyIdToken(idToken) {
   if (code !== 200 || !json) return null;
   const emailVerified = json.email_verified === true || json.email_verified === 'true';
   if (!emailVerified) return null;
-  // The owner's email lives in the ALLOWED_EMAIL script property, not in
-  // code. Unset property means no email matches (fail-closed).
-  const allowedEmail = PropertiesService.getScriptProperties().getProperty('ALLOWED_EMAIL');
-  if (!allowedEmail || json.email !== allowedEmail) return null;
+  // The owner's emails live in the ALLOWED_EMAIL script property, not in
+  // code: a comma-separated list, any of which may match. An unset
+  // property means no email matches (fail-closed).
+  const allowedEmails = String(
+    PropertiesService.getScriptProperties().getProperty('ALLOWED_EMAIL') || ''
+  )
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter((v) => v.length > 0);
+  if (!allowedEmails.includes(String(json.email || '').toLowerCase())) return null;
   const clientId = PropertiesService.getScriptProperties().getProperty('GOOGLE_CLIENT_ID');
   if (clientId && json.aud !== clientId) return null;
   return json;
