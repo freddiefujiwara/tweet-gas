@@ -24,6 +24,10 @@
  */
 
 export const API_BASE = 'https://api.twitter.com/2';
+export const MEDIA_UPLOAD_URL = 'https://api.x.com/2/media/upload';
+export const MAX_MEDIA_PER_POST = 4;
+export const MAX_MEDIA_BYTES = 5 * 1024 * 1024;
+export const MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 export const SCREEN_NAME = 'freddiefujiwara';
 export const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
 export const LOG_SHEET_NAME = 'log';
@@ -452,14 +456,74 @@ function createTweet_(payload) {
 }
 
 /**
- * Posts a tweet. Returns { id, text, url }.
+ * Validates one media item from a post request: { data, type } with
+ * data as base64 and type one of MEDIA_TYPES, at most MAX_MEDIA_BYTES
+ * once decoded. Throws on an invalid item.
  */
-export function postTweet(text) {
+export function validateMediaItem(item) {
+  if (!item || typeof item !== 'object') {
+    throw new Error('media item must be an object');
+  }
+  if (!MEDIA_TYPES.includes(item.type)) {
+    throw new Error(`unsupported media type: ${item.type}`);
+  }
+  if (typeof item.data !== 'string' || item.data === '') {
+    throw new Error('media data is empty');
+  }
+  const decodedBytes = Math.ceil((item.data.length * 3) / 4);
+  if (decodedBytes > MAX_MEDIA_BYTES) {
+    throw new Error(`media is too large: about ${decodedBytes} bytes exceeds ${MAX_MEDIA_BYTES}`);
+  }
+  return item;
+}
+
+/**
+ * Uploads one image to X and returns its media id. The upload is a
+ * multipart form post, so the body fields stay out of the OAuth
+ * signature (buildAuthorizationHeader is called without form/query).
+ */
+export function uploadMedia(item) {
+  validateMediaItem(item);
+  const credentials = getCredentials();
+  const authorization = buildAuthorizationHeader(
+    { method: 'POST', baseUrl: MEDIA_UPLOAD_URL },
+    credentials
+  );
+  const blob = Utilities.newBlob(Utilities.base64Decode(item.data), item.type, 'media');
+  const { code, json, text: body } = fetchJson(MEDIA_UPLOAD_URL, {
+    method: 'post',
+    headers: { Authorization: authorization },
+    payload: { media: blob, media_category: 'tweet_image' },
+  });
+  const id =
+    (json && json.data && json.data.id) ||
+    (json && (json.media_id_string || json.media_id));
+  if (code < 200 || code >= 300 || !id) {
+    throw new Error(`X API media upload failed (${code}): ${body}`);
+  }
+  return String(id);
+}
+
+/**
+ * Posts a tweet, optionally with images. mediaItems is an array of
+ * { data, type } (base64) items, at most MAX_MEDIA_PER_POST; each is
+ * uploaded first and attached via media_ids. Returns { id, text, url }.
+ */
+export function postTweet(text, mediaItems) {
   validateTweetText(text);
+  const items = mediaItems || [];
+  if (items.length > MAX_MEDIA_PER_POST) {
+    throw new Error(`too many media items: ${items.length} exceeds ${MAX_MEDIA_PER_POST}`);
+  }
+  items.forEach(validateMediaItem);
   if (isDryRun_()) {
     return { id: 'dry-run', text, url: null, dry_run: true };
   }
-  return createTweet_({ text });
+  const payload = { text };
+  if (items.length) {
+    payload.media = { media_ids: items.map(uploadMedia) };
+  }
+  return createTweet_(payload);
 }
 
 /**
@@ -2487,7 +2551,7 @@ export function doPost(e) {
       logToSheet('reply_comment', { email: actor, ...result });
       return jsonOutput(result);
     }
-    const posted = postTweet(body.text);
+    const posted = postTweet(body.text, body.media);
     const verified = posted.dry_run ? { id: posted.id, text: posted.text } : getTweet(posted.id);
     const result = {
       ok: true,
